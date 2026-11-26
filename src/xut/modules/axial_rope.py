@@ -143,6 +143,19 @@ class AxialRoPE(nn.Module):
 
     @compile_wrapper
     def forward(self, x, pos):
+        if pos.shape[-1] != self.freqs.shape[-1]:
+            raise ValueError(f"input shape must be (..., {self.freqs.shape[-1]})")
+        # Fast fused half-dim path (exact match to get_freqs + apply_rotary_emb, half the cos/sin ops & zero cat/repeat_interleave)
+        half_rot = self.freqs.shape[1] * self.freqs.shape[2]
+        if self.start_index == 0 and half_rot * 2 == x.shape[-1]:
+            angles = (pos[..., None, None, :].float() * self.freqs.float().exp()).flatten(-2, -1).transpose(-2, -3)
+            cos = angles.cos().to(x.dtype)
+            sin = angles.sin().to(x.dtype)
+            x_pair = x.unflatten(-1, (-1, 2))
+            x0, x1 = x_pair.unbind(-1)
+            out0 = x0 * cos - x1 * sin
+            out1 = x1 * cos + x0 * sin
+            return torch.stack((out0, out1), dim=-1).flatten(-2)
         freqs = self.get_freqs(pos)
         return apply_rotary_emb(freqs, x, self.start_index)
 

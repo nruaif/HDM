@@ -77,8 +77,9 @@ class TBackBone(nn.Module):
         if pos_map is not None:
             assert pos_map.size(1) == x.size(1)
 
-        for block in self.blocks:
-            if self.grad_ckpt:
+        for idx, block in enumerate(self.blocks):
+            do_ckpt = (self.grad_ckpt is True) or (self.grad_ckpt == "half" and idx % 2 == 0)
+            if do_ckpt:
                 x = checkpoint(
                     block,
                     x,
@@ -200,9 +201,12 @@ class XUTBackBone(nn.Module):
             assert pos_map.size(1) == x.size(1)
 
         self_ctx = []
+        b_counter = 0
         for blocks in self.enc_blocks:
             for block in blocks:
-                if self.grad_ckpt:
+                do_ckpt = (self.grad_ckpt is True) or (self.grad_ckpt == "half" and b_counter % 2 == 0)
+                b_counter += 1
+                if do_ckpt:
                     x = checkpoint(
                         block,
                         x,
@@ -222,7 +226,9 @@ class XUTBackBone(nn.Module):
 
         for blocks in self.dec_blocks:
             first_block = blocks[0]
-            if self.grad_ckpt:
+            do_ckpt = (self.grad_ckpt is True) or (self.grad_ckpt == "half" and b_counter % 2 == 0)
+            b_counter += 1
+            if do_ckpt:
                 x = checkpoint(
                     first_block,
                     x,
@@ -241,7 +247,9 @@ class XUTBackBone(nn.Module):
                 )
 
             for block in blocks[1:]:
-                if self.grad_ckpt:
+                do_ckpt = (self.grad_ckpt is True) or (self.grad_ckpt == "half" and b_counter % 2 == 0)
+                b_counter += 1
+                if do_ckpt:
                     x = checkpoint(
                         block,
                         x,
@@ -407,11 +415,37 @@ class XUDiT(nn.Module):
             )
 
     def set_grad_ckpt(self, grad_ckpt):
+        """grad_ckpt: False | True | 'half' (selective every-2nd-block checkpointing)."""
         self.backbone.grad_ckpt = grad_ckpt
         self.grad_ckpt = grad_ckpt
         if self.use_tread:
             self.prev_tread_trns.grad_ckpt = grad_ckpt
             self.post_tread_trns.grad_ckpt = grad_ckpt
+
+    def compile_blocks(self, mode: str = "default", dynamic: bool = True):
+        """
+        Compile individual TransformerBlocks with symbolic sequence lengths (`dynamic=True`)
+        and raised Dynamo cache limit so multi-AR buckets + variable prompt lengths + selective
+        checkpointing never hit Dynamo's default 8-specialization fallback limit.
+        """
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, "cache_size_limit", 8), 64)
+        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                torch._dynamo.config.accumulated_cache_size_limit, 256
+            )
+        for blocks in self.backbone.enc_blocks:
+            for i, blk in enumerate(blocks):
+                blocks[i] = torch.compile(blk, mode=mode, dynamic=dynamic)
+        for blocks in self.backbone.dec_blocks:
+            for i, blk in enumerate(blocks):
+                blocks[i] = torch.compile(blk, mode=mode, dynamic=dynamic)
+        if self.use_tread:
+            for i, blk in enumerate(self.prev_tread_trns.blocks):
+                self.prev_tread_trns.blocks[i] = torch.compile(blk, mode=mode, dynamic=dynamic)
+            for i, blk in enumerate(self.post_tread_trns.blocks):
+                self.post_tread_trns.blocks[i] = torch.compile(blk, mode=mode, dynamic=dynamic)
+        return self
 
     def forward(
         self,
@@ -480,6 +514,8 @@ class XUDiT(nn.Module):
                 )
             ctx = None
 
+        full_length = x.size(1)
+        xt_selection_length = length
         if self.use_tread:
             x = self.prev_tread_trns(
                 x,
@@ -488,34 +524,31 @@ class XUDiT(nn.Module):
                 y=t_emb,
                 shared_adaln=shared_adaln_state,
             )
-            if self.training or tread_rate is not None:
-                xt_selection_length = selection_length = length - int(
-                    length * (tread_rate or self.dropout_ratio)
-                )
-                selection = torch.stack(
-                    [
-                        torch.randperm(length, device=x.device) < selection_length
-                        for _ in range(n)
-                    ]
-                )
+            rate = tread_rate if tread_rate is not None else (self.dropout_ratio if self.training else 0.0)
+            if rate and rate > 0.0:
+                xt_selection_length = length - int(length * rate)
+                d = x.size(2)
+                # Static-shape batched permutation on GPU (zero CPU-GPU sync & torch.compile safe)
+                perm = torch.rand(n, length, device=x.device).argsort(dim=1)
+                keep_img = perm[:, :xt_selection_length]
+                drop_img = perm[:, xt_selection_length:]
+
                 if self.ctx_proj is not None:
-                    ctx_length = x.size(1) - length
-                    selection = torch.concat(
-                        [
-                            selection,
-                            torch.ones(
-                                n, ctx_length, device=x.device, dtype=torch.bool
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    selection_length += ctx_length
-                full_length = x.size(1)
-                not_masked_part = x[~selection, :]
-                masked_part = x[selection, :].unflatten(0, (n, selection_length))
-                x = masked_part
+                    ctx_idx = torch.arange(length, full_length, device=x.device).unsqueeze(0).expand(n, -1)
+                    keep_idx = torch.cat([keep_img, ctx_idx], dim=1)
+                else:
+                    keep_idx = keep_img
+
+                dropped_part = torch.gather(x, 1, drop_img.unsqueeze(-1).expand(-1, -1, d))
+                x = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(-1, -1, d))
                 raw_pos_map = pos_map
-                pos_map = pos_map[selection, :].unflatten(0, (n, selection_length))
+                if pos_map is not None:
+                    pos_map = torch.gather(
+                        pos_map, 1, keep_idx.unsqueeze(-1).expand(-1, -1, pos_map.size(2))
+                    )
+                did_tread = True
+            else:
+                did_tread = False
         backbone_out = self.backbone(
             x,
             ctx=ctx,
@@ -527,12 +560,13 @@ class XUDiT(nn.Module):
         if return_enc_out:
             backbone_out, enc_out = backbone_out
         if self.use_tread:
-            if self.training or tread_rate is not None:
+            if did_tread:
+                d = backbone_out.size(2)
                 out = torch.empty(
-                    n, full_length, x.size(2), device=x.device, dtype=x.dtype
+                    n, full_length, d, device=backbone_out.device, dtype=backbone_out.dtype
                 )
-                out[~selection, :] = not_masked_part
-                out[selection, :] = backbone_out.flatten(0, 1)
+                out.scatter_(1, drop_img.unsqueeze(-1).expand(-1, -1, d), dropped_part.to(out.dtype))
+                out.scatter_(1, keep_idx.unsqueeze(-1).expand(-1, -1, d), backbone_out)
                 pos_map = raw_pos_map
             else:
                 out = backbone_out
@@ -549,8 +583,6 @@ class XUDiT(nn.Module):
         out = self.out_patch(out, h, w)
 
         if return_enc_out:
-            length = (
-                xt_selection_length if self.use_tread and self.training else full_length
-            )
-            return out, enc_out[:, :length]
+            ret_len = xt_selection_length if (self.use_tread and did_tread) else length
+            return out, enc_out[:, :ret_len]
         return out

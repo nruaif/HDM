@@ -24,7 +24,7 @@ class PatchEmbed(nn.Module):
         b, _, h, w = x.shape
         x = self.proj(x)
         b, _, new_h, new_w = x.shape
-        if pos_map is not None:
+        if pos_map is not None and pos_map.shape[1] != new_h * new_w:
             pos_map = (
                 F.interpolate(
                     pos_map.reshape(b, h, w, -1).permute(0, 3, 1, 2),
