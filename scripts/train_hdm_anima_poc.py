@@ -251,8 +251,10 @@ class BucketedLatentStore:
                     self.buckets[bkey]["captions"].extend(info["captions"])
                 total += len(info["captions"])
 
+        pin_all = (device.type == "cuda") and (total <= 50_000)
         for bkey, b in self.buckets.items():
-            b["latents"] = torch.cat(b["latents"], dim=0).pin_memory() if device.type == "cuda" else torch.cat(b["latents"], dim=0)
+            cat = torch.cat(b["latents"], dim=0)
+            b["latents"] = cat.pin_memory() if pin_all else cat
             self.bucket_keys.append(bkey)
             self.bucket_weights.append(len(b["captions"]))
 
