@@ -461,7 +461,7 @@ def uploader_worker(hf_repo: str, upload_queue: mp.Queue):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf-repo", type=str, default="anima-turbo-512-wds")
+    parser.add_argument("--hf-repo", type=str, default="Shio-Koube/Anima-gen")
     parser.add_argument("--start-shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=60)
     parser.add_argument("--shard-size", type=int, default=5000)

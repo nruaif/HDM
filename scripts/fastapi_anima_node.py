@@ -504,7 +504,7 @@ def build_fastapi_app(api_key: str, default_work_dir: str):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     class StartRequest(BaseModel):
-        hf_repo: str = "Shio-Koube/anima-turbo-512-wds"
+        hf_repo: str = "Shio-Koube/Anima-gen"
         hf_token: str | None = None
         start_shard: int = 0
         num_shards: int = 200
@@ -652,7 +652,7 @@ def main():
     parser.add_argument("--api-key", type=str, default="")
 
     # Worker args
-    parser.add_argument("--hf-repo", type=str, default="Shio-Koube/anima-turbo-512-wds")
+    parser.add_argument("--hf-repo", type=str, default="Shio-Koube/Anima-gen")
     parser.add_argument("--start-shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=200)
     parser.add_argument("--shard-size", type=int, default=5000)
