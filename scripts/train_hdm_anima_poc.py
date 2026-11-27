@@ -99,9 +99,8 @@ def decode_eq_sdxl(vae: AutoencoderKL, latents: torch.Tensor, mean: torch.Tensor
 
 
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
-    t = torch.from_numpy(arr).permute(2, 0, 1).float() / 127.5 - 1.0
-    return t
+    arr = np.array(img.convert("RGB"), dtype=np.uint8, copy=True)
+    return torch.from_numpy(arr).permute(2, 0, 1).float() / 127.5 - 1.0
 
 
 @torch.no_grad()
@@ -136,12 +135,25 @@ def cache_wds_shards_to_latents(
         print(f"[cache] Downloading {rel_path} from {hf_repo}...", flush=True)
         local_tar = hf_hub_download(repo_id=hf_repo, filename=rel_path, repo_type="dataset")
 
-        buckets_imgs = defaultdict(list)
-        buckets_caps = defaultdict(list)
-        buckets_ids = defaultdict(list)
+        buckets_imgs: dict[str, list[torch.Tensor]] = defaultdict(list)
+        buckets_lats: dict[str, list[torch.Tensor]] = defaultdict(list)
+        buckets_caps: dict[str, list[str]] = defaultdict(list)
+        buckets_ids: dict[str, list[str]] = defaultdict(list)
+        total_imgs = 0
 
+        def _flush_bucket(bkey: str):
+            imgs = buckets_imgs[bkey]
+            if not imgs:
+                return
+            batch_t = torch.stack(imgs).to(device=device, dtype=amp_dtype)
+            imgs.clear()
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                z = vae.encode(batch_t).latent_dist.sample()
+            buckets_lats[bkey].append(((z - mean) / std).to(torch.float16).cpu())
+
+        # Stream tar sequentially and encode each bucket as soon as it reaches vae_batch_size (<300MB RAM!)
+        pending: dict[str, dict] = {}
         with tarfile.open(local_tar, "r") as tf:
-            by_key: dict[str, dict] = defaultdict(dict)
             for m in tf:
                 if not m.isfile():
                     continue
@@ -149,35 +161,40 @@ def cache_wds_shards_to_latents(
                 if "." not in name:
                     continue
                 key, ext = name.rsplit(".", 1)
-                if ext in ("webp", "png", "jpg", "txt"):
-                    by_key[key][ext] = tf.extractfile(m).read()
+                if ext not in ("webp", "png", "jpg", "txt"):
+                    continue
+                item = pending.setdefault(key, {})
+                item[ext] = tf.extractfile(m).read()
+                img_ext = next((e for e in ("webp", "png", "jpg") if e in item), None)
+                if img_ext and "txt" in item:
+                    im = Image.open(io.BytesIO(item[img_ext])).convert("RGB")
+                    w, h = im.size
+                    bkey = f"{w}x{h}"
+                    buckets_imgs[bkey].append(pil_to_tensor(im))
+                    buckets_caps[bkey].append(item["txt"].decode("utf-8", errors="replace").strip())
+                    buckets_ids[bkey].append(key)
+                    total_imgs += 1
+                    pending.pop(key)
+                    if len(buckets_imgs[bkey]) >= vae_batch_size:
+                        _flush_bucket(bkey)
 
-        for key, item in by_key.items():
-            if "webp" not in item and "png" not in item and "jpg" not in item:
+        for key, item in pending.items():
+            img_ext = next((e for e in ("webp", "png", "jpg") if e in item), None)
+            if not img_ext:
                 continue
-            raw_img = item.get("webp") or item.get("png") or item.get("jpg")
-            im = Image.open(io.BytesIO(raw_img)).convert("RGB")
+            im = Image.open(io.BytesIO(item[img_ext])).convert("RGB")
             w, h = im.size
             bkey = f"{w}x{h}"
             buckets_imgs[bkey].append(pil_to_tensor(im))
-            cap = item.get("txt", b"").decode("utf-8", errors="replace").strip()
-            buckets_caps[bkey].append(cap)
+            buckets_caps[bkey].append(item.get("txt", b"").decode("utf-8", errors="replace").strip())
             buckets_ids[bkey].append(key)
+            total_imgs += 1
 
-        tensors_out = {}
-        meta_out = {}
-        total_imgs = 0
-        for bkey, img_list in buckets_imgs.items():
-            lat_chunks = []
-            for start in range(0, len(img_list), vae_batch_size):
-                batch_t = torch.stack(img_list[start : start + vae_batch_size]).to(device=device, dtype=amp_dtype)
-                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                    z = vae.encode(batch_t).latent_dist.sample()
-                z = ((z - mean) / std).to(torch.float16).cpu()
-                lat_chunks.append(z)
-            tensors_out[f"lat_{bkey}"] = torch.cat(lat_chunks, dim=0)
-            meta_out[bkey] = {"ids": buckets_ids[bkey], "captions": buckets_caps[bkey]}
-            total_imgs += len(img_list)
+        for bkey in list(buckets_imgs.keys()):
+            _flush_bucket(bkey)
+
+        tensors_out = {f"lat_{bkey}": torch.cat(chunks, dim=0) for bkey, chunks in buckets_lats.items()}
+        meta_out = {bkey: {"ids": buckets_ids[bkey], "captions": buckets_caps[bkey]} for bkey in buckets_lats}
 
         save_file(tensors_out, str(lat_path))
         meta_path.write_text(json.dumps(meta_out, ensure_ascii=False), encoding="utf-8")
