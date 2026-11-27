@@ -329,20 +329,35 @@ class BucketedLatentStore:
 # ---------------------------------------------------------------------------
 # 3. Model Loading, muP Optimizer & Validation
 # ---------------------------------------------------------------------------
-def load_hdm_sdxl(hdm_repo: str, device: torch.device, grad_ckpt: str | bool = "half") -> XUDiT:
+def clean_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("model."):
+            k = k[len("model."):]
+        k = k.replace("._orig_mod.", ".")
+        out[k] = v
+    return out
+
+
+def load_hdm_sdxl(hdm_repo: str, device: torch.device, grad_ckpt: str | bool = "half", resume_path: str = "") -> XUDiT:
     cfg_path = hf_hub_download(hdm_repo, "transformer/config.json")
-    ckpt_path = hf_hub_download(hdm_repo, "transformer/diffusion_pytorch_model.safetensors")
     cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
     for k in list(cfg.keys()):
         if k.startswith("_"):
             cfg.pop(k)
 
     model = XUDiT(**cfg)
-    raw_sd = load_file(ckpt_path, device="cpu")
-    state_dict = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in raw_sd.items()}
+    if resume_path:
+        raw_sd = load_file(resume_path, device="cpu")
+        src_label = resume_path
+    else:
+        ckpt_path = hf_hub_download(hdm_repo, "transformer/diffusion_pytorch_model.safetensors")
+        raw_sd = load_file(ckpt_path, device="cpu")
+        src_label = hdm_repo
+    state_dict = clean_state_dict(raw_sd)
     model.load_state_dict(state_dict, strict=True)
     model.set_grad_ckpt(grad_ckpt)
-    print(f"Loaded HDM-xut-340M from {hdm_repo} (grad_ckpt={grad_ckpt}).", flush=True)
+    print(f"Loaded HDM-xut-340M from {src_label} (grad_ckpt={grad_ckpt}).", flush=True)
     return model.to(device)
 
 
@@ -444,6 +459,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=0.05, help="muP LR (divides by fan_in)")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--tread_rate", type=float, default=0.5)
+    p.add_argument("--delta_fm_lambda", type=float, default=0.05, help="Contrastive Flow Matching (DeltaFM, arXiv:2506.05350) weight (0.0 to disable)")
+    p.add_argument("--resume", type=str, default="", help="Optional .safetensors checkpoint path to resume weights from")
+    p.add_argument("--start_epoch", type=int, default=1, help="Starting epoch index when resuming (e.g. 2 after epoch 1)")
     p.add_argument("--tag_dropout", type=float, default=0.1)
     p.add_argument("--max_ctx_len", type=int, default=128)
     p.add_argument("--grad_ckpt", type=str, default="auto", choices=["auto", "true", "half", "false"])
@@ -456,6 +474,7 @@ def parse_args():
     p.add_argument("--val_num_prompts", type=int, default=12, help="Number of dataset prompts for validation grid")
     p.add_argument("--wandb_project", type=str, default="", help="W&B project name (empty = disabled)")
     p.add_argument("--wandb_run_name", type=str, default="")
+    p.add_argument("--wandb_run_id", type=str, default="", help="Optional W&B run ID to resume")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -492,7 +511,11 @@ def main():
     wb = None
     if args.wandb_project:
         import wandb
-        wb = wandb.init(project=args.wandb_project, name=args.wandb_run_name or None, config=vars(args))
+        wb_kwargs = dict(project=args.wandb_project, name=args.wandb_run_name or None, config=vars(args))
+        if args.wandb_run_id:
+            wb_kwargs["id"] = args.wandb_run_id
+            wb_kwargs["resume"] = "allow"
+        wb = wandb.init(**wb_kwargs)
         print(f"W&B run initialized: {wb.url}", flush=True)
 
     # 1. Load EQ-SDXL-VAE and cache WDS shards offline
@@ -517,7 +540,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     text_encoder = Qwen3Model.from_pretrained(args.hdm_repo, subfolder="text_encoder", torch_dtype=amp_dtype).to(device).eval().requires_grad_(False)
 
-    model = load_hdm_sdxl(args.hdm_repo, device=device, grad_ckpt=grad_ckpt)
+    model = load_hdm_sdxl(args.hdm_repo, device=device, grad_ckpt=grad_ckpt, resume_path=args.resume)
     if getattr(model, "use_tread", False):
         model.dropout_ratio = args.tread_rate
     if args.compile and device.type == "cuda":
@@ -528,11 +551,12 @@ def main():
     val_prompts = store.sample_val_prompts(n=args.val_num_prompts, seed=args.seed)
     (out_dir / "val_prompts.txt").write_text("\n".join(f"[{i+1}] {p}" for i, p in enumerate(val_prompts)), encoding="utf-8")
 
-    # Step 0 baseline validation
-    g0 = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
-    if wb is not None:
-        import wandb
-        wb.log({"val/grid": wandb.Image(str(g0), caption="Step 0 (baseline)"), "epoch": 0}, step=0)
+    # Step 0 baseline validation (skip when resuming past epoch 1)
+    if not args.resume and args.start_epoch <= 1:
+        g0 = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+        if wb is not None:
+            import wandb
+            wb.log({"val/grid": wandb.Image(str(g0), caption="Step 0 (baseline)"), "epoch": 0}, step=0)
 
     optimizer = build_mup_optimizer(model, base_lr=args.lr, use_cuda=(device.type == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
@@ -540,7 +564,9 @@ def main():
     # 3. Fast Training Loop (Epoch-based when --epochs > 0, else Step-based)
     model.train()
     ema_loss = None
+    ema_fm_loss = None
     t0 = time.time()
+    print(f"Objective: {'Contrastive Flow Matching (DeltaFM, lambda=' + str(args.delta_fm_lambda) + ')' if args.delta_fm_lambda > 0 else 'Standard Flow Matching'}", flush=True)
 
     def _train_step(latents, captions, pos_map, log_ars, scale_loss: float = 1.0):
         latents = latents.to(device=device, non_blocking=True)
@@ -560,18 +586,33 @@ def main():
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
             pred = model(noisy.to(amp_dtype), t.view(b).to(amp_dtype), ctx=ctx, pos_map=pos_map, addon_info=log_ars)
-        loss = F.mse_loss(pred.float(), target) * scale_loss
+        pred_f = pred.float()
+        fm_loss = F.mse_loss(pred_f, target)
+        if args.delta_fm_lambda > 0.0 and b > 1:
+            # DeltaFM (arXiv:2506.05350, Alg. 1): sample independent in-batch negative j != i
+            neg_idx = (torch.arange(b, device=device) + torch.randint(1, b, (b,), device=device)) % b
+            neg_loss = F.mse_loss(pred_f, target[neg_idx])
+            loss = (fm_loss - args.delta_fm_lambda * neg_loss) * scale_loss
+            neg_val = float(neg_loss.item()) * scale_loss
+        else:
+            loss = fm_loss * scale_loss
+            neg_val = 0.0
         scaler.scale(loss).backward()
-        return float(loss.item())
+        return float(loss.item()), float(fm_loss.item()) * scale_loss, neg_val
 
     if args.epochs > 0:
-        global_step = 0
-        for epoch in range(1, args.epochs + 1):
+        steps_per_ep = store.epoch_num_batches(args.batch_size) // args.grad_accum
+        global_step = max(0, args.start_epoch - 1) * steps_per_ep
+        run_steps = 0
+        for epoch in range(args.start_epoch, args.epochs + 1):
             ep_t0 = time.time()
             ep_losses = []
+            ep_fm_losses = []
             optimizer.zero_grad(set_to_none=True)
             accum_cnt = 0
             step_loss = 0.0
+            step_fm = 0.0
+            step_neg = 0.0
             n_ep_batches = store.epoch_num_batches(args.batch_size)
             pbar = tqdm(
                 store.iter_epoch_batches(args.batch_size, seed=args.seed + epoch, tag_dropout=args.tag_dropout),
@@ -579,7 +620,10 @@ def main():
                 desc=f"Epoch {epoch}/{args.epochs}",
             )
             for latents, captions, pos_map, log_ars in pbar:
-                step_loss += _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
+                l_tot, l_fm, l_neg = _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
+                step_loss += l_tot
+                step_fm += l_fm
+                step_neg += l_neg
                 accum_cnt += 1
                 if accum_cnt == args.grad_accum:
                     scaler.unscale_(optimizer)
@@ -588,21 +632,29 @@ def main():
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    run_steps += 1
                     ep_losses.append(step_loss)
+                    ep_fm_losses.append(step_fm)
                     ema_loss = step_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * step_loss
-                    pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}")
-                    accum_cnt = 0
-                    step_loss = 0.0
+                    ema_fm_loss = step_fm if ema_fm_loss is None else 0.98 * ema_fm_loss + 0.02 * step_fm
+                    pbar.set_postfix(fm=f"{step_fm:.4f}", ema_fm=f"{ema_fm_loss:.4f}", dfm=f"{step_loss:.4f}")
                     if wb is not None and global_step % 50 == 0:
                         wb.log(
                             {
-                                "train/loss": ep_losses[-1],
-                                "train/ema_loss": ema_loss,
+                                "train/loss": step_loss,
+                                "train/fm_loss": step_fm,
+                                "train/contrastive_loss": step_neg,
+                                "train/ema_loss": ema_fm_loss,
+                                "train/ema_total_loss": ema_loss,
                                 "train/epoch": epoch,
-                                "train/img_s": (global_step * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0),
+                                "train/img_s": (run_steps * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0),
                             },
                             step=global_step,
                         )
+                    accum_cnt = 0
+                    step_loss = 0.0
+                    step_fm = 0.0
+                    step_neg = 0.0
                     if args.val_every > 0 and global_step % args.val_every == 0:
                         g_path = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
                         if wb is not None:
@@ -611,31 +663,37 @@ def main():
 
             ep_dt = time.time() - ep_t0
             mean_ep = sum(ep_losses) / max(1, len(ep_losses))
-            print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_loss={mean_ep:.4f} | ema={ema_loss:.4f} | step={global_step} ===", flush=True)
+            mean_ep_fm = sum(ep_fm_losses) / max(1, len(ep_fm_losses))
+            print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_fm={mean_ep_fm:.4f} | mean_dfm={mean_ep:.4f} | ema_fm={ema_fm_loss:.4f} | step={global_step} ===", flush=True)
             g_path = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
             if wb is not None:
                 import wandb
                 wb.log(
                     {
                         "epoch/mean_loss": mean_ep,
-                        "epoch/ema_loss": ema_loss,
+                        "epoch/mean_fm_loss": mean_ep_fm,
+                        "epoch/ema_loss": ema_fm_loss,
                         "epoch/time_sec": ep_dt,
                         "epoch": epoch,
-                        "val/grid": wandb.Image(str(g_path), caption=f"Epoch {epoch}"),
+                        "val/grid": wandb.Image(str(g_path), caption=f"Epoch {epoch} (DeltaFM)"),
                     },
                     step=global_step,
                 )
-            save_file(model.state_dict(), str(out_dir / "hdm_latest.safetensors"))
+            clean_sd = clean_state_dict(model.state_dict())
+            save_file(clean_sd, str(out_dir / "hdm_latest.safetensors"))
             if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
-                save_file(model.state_dict(), str(out_dir / f"hdm_epoch_{epoch:03d}.safetensors"))
+                save_file(clean_sd, str(out_dir / f"hdm_epoch_{epoch:03d}.safetensors"))
     else:
         pbar = tqdm(range(1, args.steps + 1), desc="HDM Anima PoC")
         for step in pbar:
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
+            step_fm = 0.0
             for _ in range(args.grad_accum):
                 latents, captions, pos_map, log_ars = store.sample_batch(args.batch_size, tag_dropout=args.tag_dropout)
-                step_loss += _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
+                l_tot, l_fm, _ = _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
+                step_loss += l_tot
+                step_fm += l_fm
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -643,14 +701,15 @@ def main():
             scaler.update()
 
             ema_loss = step_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * step_loss
-            pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}", img_s=f"{(step * args.batch_size * args.grad_accum) / (time.time() - t0):.1f}")
+            ema_fm_loss = step_fm if ema_fm_loss is None else 0.98 * ema_fm_loss + 0.02 * step_fm
+            pbar.set_postfix(fm=f"{step_fm:.4f}", ema_fm=f"{ema_fm_loss:.4f}", img_s=f"{(step * args.batch_size * args.grad_accum) / (time.time() - t0):.1f}")
 
             if args.val_every > 0 and step % args.val_every == 0:
                 run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
             if args.save_every > 0 and step % args.save_every == 0:
-                save_file(model.state_dict(), str(out_dir / f"hdm_step_{step:05d}.safetensors"))
+                save_file(clean_state_dict(model.state_dict()), str(out_dir / f"hdm_step_{step:05d}.safetensors"))
 
-    save_file(model.state_dict(), str(out_dir / "hdm_final.safetensors"))
+    save_file(clean_state_dict(model.state_dict()), str(out_dir / "hdm_final.safetensors"))
     print(f"Training complete in {time.time() - t0:.1f}s! Checkpoints & grids in {out_dir}", flush=True)
 
 
