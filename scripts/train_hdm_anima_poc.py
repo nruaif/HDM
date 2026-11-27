@@ -426,6 +426,7 @@ def run_validation(
     grid.save(grid_jpg, "JPEG", quality=88, optimize=True)
     print(f"[val] Saved {len(imgs)} samples ({cols}x{rows}) -> {grid_jpg}", flush=True)
     model.train()
+    return grid_jpg
 
 
 def parse_args():
@@ -453,6 +454,8 @@ def parse_args():
     p.add_argument("--val_steps", type=int, default=24)
     p.add_argument("--val_cfg", type=float, default=3.5)
     p.add_argument("--val_num_prompts", type=int, default=12, help="Number of dataset prompts for validation grid")
+    p.add_argument("--wandb_project", type=str, default="", help="W&B project name (empty = disabled)")
+    p.add_argument("--wandb_run_name", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -485,6 +488,12 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU'} ({vram_gb:.1f} GB) | AMP={amp_dtype} | grad_ckpt={grad_ckpt}", flush=True)
+
+    wb = None
+    if args.wandb_project:
+        import wandb
+        wb = wandb.init(project=args.wandb_project, name=args.wandb_run_name or None, config=vars(args))
+        print(f"W&B run initialized: {wb.url}", flush=True)
 
     # 1. Load EQ-SDXL-VAE and cache WDS shards offline
     vae = AutoencoderKL.from_pretrained(args.hdm_repo, subfolder="vae", torch_dtype=amp_dtype).eval().requires_grad_(False)
@@ -520,7 +529,10 @@ def main():
     (out_dir / "val_prompts.txt").write_text("\n".join(f"[{i+1}] {p}" for i, p in enumerate(val_prompts)), encoding="utf-8")
 
     # Step 0 baseline validation
-    run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+    g0 = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+    if wb is not None:
+        import wandb
+        wb.log({"val/grid": wandb.Image(str(g0), caption="Step 0 (baseline)"), "epoch": 0}, step=0)
 
     optimizer = build_mup_optimizer(model, base_lr=args.lr, use_cuda=(device.type == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
@@ -581,13 +593,38 @@ def main():
                     pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}")
                     accum_cnt = 0
                     step_loss = 0.0
+                    if wb is not None and global_step % 50 == 0:
+                        wb.log(
+                            {
+                                "train/loss": ep_losses[-1],
+                                "train/ema_loss": ema_loss,
+                                "train/epoch": epoch,
+                                "train/img_s": (global_step * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0),
+                            },
+                            step=global_step,
+                        )
                     if args.val_every > 0 and global_step % args.val_every == 0:
-                        run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+                        g_path = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+                        if wb is not None:
+                            import wandb
+                            wb.log({"val/grid": wandb.Image(str(g_path), caption=f"Step {global_step}")}, step=global_step)
 
             ep_dt = time.time() - ep_t0
             mean_ep = sum(ep_losses) / max(1, len(ep_losses))
             print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_loss={mean_ep:.4f} | ema={ema_loss:.4f} | step={global_step} ===", flush=True)
-            run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+            g_path = run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+            if wb is not None:
+                import wandb
+                wb.log(
+                    {
+                        "epoch/mean_loss": mean_ep,
+                        "epoch/ema_loss": ema_loss,
+                        "epoch/time_sec": ep_dt,
+                        "epoch": epoch,
+                        "val/grid": wandb.Image(str(g_path), caption=f"Epoch {epoch}"),
+                    },
+                    step=global_step,
+                )
             save_file(model.state_dict(), str(out_dir / "hdm_latest.safetensors"))
             if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
                 save_file(model.state_dict(), str(out_dir / f"hdm_epoch_{epoch:03d}.safetensors"))
