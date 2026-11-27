@@ -313,6 +313,18 @@ class BucketedLatentStore:
         tot = sum(len(self.buckets[k]["captions"]) // batch_size for k in self.bucket_keys)
         return tot // world_size
 
+    def sample_val_prompts(self, n: int = 12, seed: int = 42) -> list[str]:
+        """Deterministically sample n diverse prompts from the cached dataset."""
+        rng = random.Random(seed)
+        prompts = []
+        keys = sorted(self.bucket_keys)
+        for i in range(n):
+            bkey = keys[i % len(keys)]
+            caps = self.buckets[bkey]["captions"]
+            raw = caps[rng.randrange(len(caps))]
+            prompts.append(normalize_anima_caption(raw, tag_shuffle=False, tag_dropout=0.0))
+        return prompts
+
 
 # ---------------------------------------------------------------------------
 # 3. Model Loading, muP Optimizer & Validation
@@ -367,6 +379,7 @@ def run_validation(
     step: int,
     device: torch.device,
     amp_dtype: torch.dtype,
+    prompts: list[str] | None = None,
     num_steps: int = 24,
     cfg_scale: float = 3.5,
     tread_gamma2: float = 0.25,
@@ -374,7 +387,7 @@ def run_validation(
 ):
     model.eval()
     resolution = 512
-    prompts = VAL_PROMPTS
+    prompts = prompts or VAL_PROMPTS
     neg_prompts = [VAL_NEG_PROMPT] * len(prompts)
     pos_tok = tokenizer(prompts, padding="longest", truncation=True, max_length=128, return_tensors="pt")
     neg_tok = tokenizer(neg_prompts, padding="longest", truncation=True, max_length=128, return_tensors="pt")
@@ -404,12 +417,14 @@ def run_validation(
     vae.to("cpu")
     torch.cuda.empty_cache()
 
-    grid = Image.new("RGB", (resolution * 2, resolution * 2))
+    cols = 4 if len(imgs) >= 4 else len(imgs)
+    rows = math.ceil(len(imgs) / cols)
+    grid = Image.new("RGB", (resolution * cols, resolution * rows))
     for idx, im in enumerate(imgs):
-        grid.paste(im, ((idx % 2) * resolution, (idx // 2) * resolution))
+        grid.paste(im, ((idx % cols) * resolution, (idx // cols) * resolution))
     grid_jpg = out_dir / f"val_step_{step:05d}_grid.jpg"
     grid.save(grid_jpg, "JPEG", quality=88, optimize=True)
-    print(f"[val] Saved 2x2 grid -> {grid_jpg}", flush=True)
+    print(f"[val] Saved {len(imgs)} samples ({cols}x{rows}) -> {grid_jpg}", flush=True)
     model.train()
 
 
@@ -437,6 +452,7 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=5, help="Epoch interval (when --epochs>0) or step interval to save checkpoints")
     p.add_argument("--val_steps", type=int, default=24)
     p.add_argument("--val_cfg", type=float, default=3.5)
+    p.add_argument("--val_num_prompts", type=int, default=12, help="Number of dataset prompts for validation grid")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -499,8 +515,12 @@ def main():
         print("Compiling XUDiT blocks (dynamic=True)...", flush=True)
         model.compile_blocks(mode="default", dynamic=True)
 
+    # Sample deterministic validation prompts from the dataset
+    val_prompts = store.sample_val_prompts(n=args.val_num_prompts, seed=args.seed)
+    (out_dir / "val_prompts.txt").write_text("\n".join(f"[{i+1}] {p}" for i, p in enumerate(val_prompts)), encoding="utf-8")
+
     # Step 0 baseline validation
-    run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+    run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, 0, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
 
     optimizer = build_mup_optimizer(model, base_lr=args.lr, use_cuda=(device.type == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
@@ -562,12 +582,13 @@ def main():
                     accum_cnt = 0
                     step_loss = 0.0
                     if args.val_every > 0 and global_step % args.val_every == 0:
-                        run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+                        run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
 
             ep_dt = time.time() - ep_t0
             mean_ep = sum(ep_losses) / max(1, len(ep_losses))
             print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_loss={mean_ep:.4f} | ema={ema_loss:.4f} | step={global_step} ===", flush=True)
-            run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+            run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
+            save_file(model.state_dict(), str(out_dir / "hdm_latest.safetensors"))
             if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
                 save_file(model.state_dict(), str(out_dir / f"hdm_epoch_{epoch:03d}.safetensors"))
     else:
@@ -588,7 +609,7 @@ def main():
             pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}", img_s=f"{(step * args.batch_size * args.grad_accum) / (time.time() - t0):.1f}")
 
             if args.val_every > 0 and step % args.val_every == 0:
-                run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, step, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+                run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, step, device, amp_dtype, prompts=val_prompts, num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed)
             if args.save_every > 0 and step % args.save_every == 0:
                 save_file(model.state_dict(), str(out_dir / f"hdm_step_{step:05d}.safetensors"))
 
