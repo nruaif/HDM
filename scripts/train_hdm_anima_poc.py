@@ -181,6 +181,14 @@ def cache_wds_shards_to_latents(
 
         save_file(tensors_out, str(lat_path))
         meta_path.write_text(json.dumps(meta_out, ensure_ascii=False), encoding="utf-8")
+        # Clean downloaded .tar blob so 50+ shards don't double-use disk space
+        try:
+            real_tar = Path(local_tar).resolve()
+            Path(local_tar).unlink(missing_ok=True)
+            if real_tar != Path(local_tar) and real_tar.exists():
+                real_tar.unlink(missing_ok=True)
+        except Exception:
+            pass
         dt = time.time() - t0
         size_mb = lat_path.stat().st_size / (1024 * 1024)
         print(f"[cache] Encoded {total_imgs:,} imgs -> {lat_path.name} ({size_mb:.1f} MB) in {dt:.1f}s ({total_imgs/dt:.1f} img/s)", flush=True)
@@ -260,6 +268,31 @@ class BucketedLatentStore:
         pos_map = b["pos_map"].unsqueeze(0).expand(batch_size, -1, -1)
         log_ars = torch.full((batch_size,), b["log_ar"], dtype=pos_map.dtype)
         return latents, captions, pos_map, log_ars
+
+    def iter_epoch_batches(self, batch_size: int, seed: int, rank: int = 0, world_size: int = 1, tag_dropout: float = 0.1):
+        """Yield shuffled homogeneous-AR batches covering 1 full epoch across DDP ranks."""
+        rng = np.random.default_rng(seed)
+        all_batches = []
+        for bkey in self.bucket_keys:
+            n = len(self.buckets[bkey]["captions"])
+            perm = rng.permutation(n)
+            for start in range(0, n - batch_size + 1, batch_size):
+                all_batches.append((bkey, perm[start : start + batch_size]))
+        rng.shuffle(all_batches)
+        # Trim so all DDP ranks execute identical number of batches
+        usable = (len(all_batches) // world_size) * world_size
+        for bkey, idx_arr in all_batches[rank:usable:world_size]:
+            b = self.buckets[bkey]
+            idx_t = torch.from_numpy(idx_arr)
+            latents = b["latents"][idx_t]
+            captions = [normalize_anima_caption(b["captions"][int(i)], tag_shuffle=True, tag_dropout=tag_dropout) for i in idx_arr]
+            pos_map = b["pos_map"].unsqueeze(0).expand(batch_size, -1, -1)
+            log_ars = torch.full((batch_size,), b["log_ar"], dtype=pos_map.dtype)
+            yield latents, captions, pos_map, log_ars
+
+    def epoch_num_batches(self, batch_size: int, world_size: int = 1) -> int:
+        tot = sum(len(self.buckets[k]["captions"]) // batch_size for k in self.bucket_keys)
+        return tot // world_size
 
 
 # ---------------------------------------------------------------------------
@@ -367,11 +400,12 @@ def parse_args():
     p.add_argument("--hdm_repo", type=str, default="KBlueLeaf/HDM-xut-340M-anime")
     p.add_argument("--cache_dir", type=str, default="./cache/anima_eqsdxl_latents")
     p.add_argument("--out_dir", type=str, default="./outputs/hdm_anima_poc")
-    p.add_argument("--num_shards", type=int, default=4, help="Number of 5k WDS shards to cache & train on")
+    p.add_argument("--num_shards", type=int, default=50, help="Number of 5k WDS shards to cache & train on")
     p.add_argument("--vae_batch_size", type=int, default=32)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--grad_accum", type=int, default=2)
-    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=100, help="Number of full dataset epochs (>0 overrides --steps)")
+    p.add_argument("--steps", type=int, default=0, help="Optional fixed step count (used only if --epochs 0)")
     p.add_argument("--lr", type=float, default=0.05, help="muP LR (divides by fan_in)")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--tread_rate", type=float, default=0.5)
@@ -380,8 +414,8 @@ def parse_args():
     p.add_argument("--grad_ckpt", type=str, default="auto", choices=["auto", "true", "half", "false"])
     p.add_argument("--compile", action="store_true", default=True)
     p.add_argument("--no_compile", dest="compile", action="store_false")
-    p.add_argument("--val_every", type=int, default=250)
-    p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--val_every", type=int, default=0, help="Step-based val interval (0 = eval every epoch when --epochs > 0)")
+    p.add_argument("--save_every", type=int, default=5, help="Epoch interval (when --epochs>0) or step interval to save checkpoints")
     p.add_argument("--val_steps", type=int, default=24)
     p.add_argument("--val_cfg", type=float, default=3.5)
     p.add_argument("--seed", type=int, default=42)
@@ -452,53 +486,95 @@ def main():
     optimizer = build_mup_optimizer(model, base_lr=args.lr, use_cuda=(device.type == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
 
-    # 3. Fast Training Loop
+    # 3. Fast Training Loop (Epoch-based when --epochs > 0, else Step-based)
     model.train()
     ema_loss = None
     t0 = time.time()
-    pbar = tqdm(range(1, args.steps + 1), desc="HDM Anima PoC")
-    for step in pbar:
-        optimizer.zero_grad(set_to_none=True)
-        step_loss = 0.0
 
-        for _ in range(args.grad_accum):
-            latents, captions, pos_map, log_ars = store.sample_batch(args.batch_size, tag_dropout=args.tag_dropout)
-            latents = latents.to(device=device, non_blocking=True)
-            pos_map = pos_map.to(device=device, non_blocking=True)
-            log_ars = log_ars.to(device=device, non_blocking=True)
+    def _train_step(latents, captions, pos_map, log_ars, scale_loss: float = 1.0):
+        latents = latents.to(device=device, non_blocking=True)
+        pos_map = pos_map.to(device=device, non_blocking=True)
+        log_ars = log_ars.to(device=device, non_blocking=True)
 
-            captions_drop = ["" if random.random() < 0.1 else c for c in captions]
-            toks = tokenizer(captions_drop, padding="longest", truncation=True, max_length=args.max_ctx_len, return_tensors="pt")
-            with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                ctx = text_encoder(input_ids=toks.input_ids.to(device, non_blocking=True), attention_mask=toks.attention_mask.to(device, non_blocking=True)).last_hidden_state
+        captions_drop = ["" if random.random() < 0.1 else c for c in captions]
+        toks = tokenizer(captions_drop, padding="longest", truncation=True, max_length=args.max_ctx_len, return_tensors="pt")
+        with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+            ctx = text_encoder(input_ids=toks.input_ids.to(device, non_blocking=True), attention_mask=toks.attention_mask.to(device, non_blocking=True)).last_hidden_state
 
-            b = latents.shape[0]
-            noise = torch.randn_like(latents, dtype=torch.float32)
-            t = torch.sigmoid(torch.randn(b, 1, 1, 1, device=device))
-            noisy = t * noise + (1.0 - t) * latents.float()
-            target = noise - latents.float()
+        b = latents.shape[0]
+        noise = torch.randn_like(latents, dtype=torch.float32)
+        t = torch.sigmoid(torch.randn(b, 1, 1, 1, device=device))
+        noisy = t * noise + (1.0 - t) * latents.float()
+        target = noise - latents.float()
 
-            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                pred = model(noisy.to(amp_dtype), t.view(b).to(amp_dtype), ctx=ctx, pos_map=pos_map, addon_info=log_ars)
-            loss = F.mse_loss(pred.float(), target) / args.grad_accum
-            scaler.scale(loss).backward()
-            step_loss += float(loss.item())
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+            pred = model(noisy.to(amp_dtype), t.view(b).to(amp_dtype), ctx=ctx, pos_map=pos_map, addon_info=log_ars)
+        loss = F.mse_loss(pred.float(), target) * scale_loss
+        scaler.scale(loss).backward()
+        return float(loss.item())
 
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+    if args.epochs > 0:
+        global_step = 0
+        for epoch in range(1, args.epochs + 1):
+            ep_t0 = time.time()
+            ep_losses = []
+            optimizer.zero_grad(set_to_none=True)
+            accum_cnt = 0
+            step_loss = 0.0
+            n_ep_batches = store.epoch_num_batches(args.batch_size)
+            pbar = tqdm(
+                store.iter_epoch_batches(args.batch_size, seed=args.seed + epoch, tag_dropout=args.tag_dropout),
+                total=n_ep_batches,
+                desc=f"Epoch {epoch}/{args.epochs}",
+            )
+            for latents, captions, pos_map, log_ars in pbar:
+                step_loss += _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
+                accum_cnt += 1
+                if accum_cnt == args.grad_accum:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    ep_losses.append(step_loss)
+                    ema_loss = step_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * step_loss
+                    pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}")
+                    accum_cnt = 0
+                    step_loss = 0.0
+                    if args.val_every > 0 and global_step % args.val_every == 0:
+                        run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, global_step, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
 
-        ema_loss = step_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * step_loss
-        pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}", img_s=f"{(step * args.batch_size * args.grad_accum) / (time.time() - t0):.1f}")
+            ep_dt = time.time() - ep_t0
+            mean_ep = sum(ep_losses) / max(1, len(ep_losses))
+            print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_loss={mean_ep:.4f} | ema={ema_loss:.4f} | step={global_step} ===", flush=True)
+            run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, epoch, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+            if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
+                save_file(model.state_dict(), str(out_dir / f"hdm_epoch_{epoch:03d}.safetensors"))
+    else:
+        pbar = tqdm(range(1, args.steps + 1), desc="HDM Anima PoC")
+        for step in pbar:
+            optimizer.zero_grad(set_to_none=True)
+            step_loss = 0.0
+            for _ in range(args.grad_accum):
+                latents, captions, pos_map, log_ars = store.sample_batch(args.batch_size, tag_dropout=args.tag_dropout)
+                step_loss += _train_step(latents, captions, pos_map, log_ars, scale_loss=1.0 / args.grad_accum)
 
-        if args.val_every > 0 and step % args.val_every == 0:
-            run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, step, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
-        if args.save_every > 0 and step % args.save_every == 0:
-            save_file(model.state_dict(), str(out_dir / f"hdm_step_{step:05d}.safetensors"))
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+            ema_loss = step_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * step_loss
+            pbar.set_postfix(loss=f"{step_loss:.4f}", ema=f"{ema_loss:.4f}", img_s=f"{(step * args.batch_size * args.grad_accum) / (time.time() - t0):.1f}")
+
+            if args.val_every > 0 and step % args.val_every == 0:
+                run_validation(model, text_encoder, tokenizer, vae, mean, std, out_dir, step, device, amp_dtype, args.val_steps, args.val_cfg, seed=args.seed)
+            if args.save_every > 0 and step % args.save_every == 0:
+                save_file(model.state_dict(), str(out_dir / f"hdm_step_{step:05d}.safetensors"))
 
     save_file(model.state_dict(), str(out_dir / "hdm_final.safetensors"))
-    print(f"PoC training complete in {time.time() - t0:.1f}s! Checkpoints & grids in {out_dir}", flush=True)
+    print(f"Training complete in {time.time() - t0:.1f}s! Checkpoints & grids in {out_dir}", flush=True)
 
 
 if __name__ == "__main__":
