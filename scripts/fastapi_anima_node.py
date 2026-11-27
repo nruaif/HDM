@@ -1,32 +1,3 @@
-"""
-Self-contained FastAPI control server + 8-GPU Anima-Turbo WDS generator.
-
-Designed for machines where you have NO SSH access, only a FastAPI HTTP port:
-  - Single standalone file (only requires PyTorch + standard HF/diffusers/FastAPI deps).
-  - Resumable: checks Hugging Face Hub (`shards/data-XXXX.tar`) and deterministic Danbooru2026
-    manifests (`seed=42`) so multiple machines can work on non-overlapping shard ranges
-    (e.g. L40S finishes 0048..0079 while 8xGPU friend node runs start_shard=80..200) with zero duplicates.
-  - Multi-threaded HF uploader (`upload_workers=2`) so 8 GPUs never stall waiting on uploads.
-
-Friend (on 8xGPU machine):
-    pip install -U fastapi uvicorn "diffusers>=0.37.0" "transformers>=4.52.0" accelerate safetensors huggingface_hub pillow sentencepiece pyarrow fsspec aiohttp requests torchao
-    export ANIMA_API_KEY="pick-a-secret-key"
-    python3 fastapi_anima_node.py --host 0.0.0.0 --port 8000
-
-You (from your PC):
-    # Start shards 80..199 across all 8 GPUs
-    curl -X POST http://<FRIEND_HOST>:8000/start \
-      -H "Authorization: Bearer pick-a-secret-key" \
-      -H "Content-Type: application/json" \
-      -d '{"hf_repo":"Shio-Koube/anima-turbo-512-wds","hf_token":"hf_...","start_shard":80,"num_shards":200,"batch_size":24,"steps":8,"fp8":true}'
-
-    # Check all 8 GPUs + logs
-    curl -H "Authorization: Bearer pick-a-secret-key" http://<FRIEND_HOST>:8000/status
-
-    # Stop cleanly
-    curl -X POST -H "Authorization: Bearer pick-a-secret-key" http://<FRIEND_HOST>:8000/stop
-"""
-
 import argparse
 import io
 import json
@@ -199,21 +170,8 @@ def prepare_and_plan(args) -> tuple[str, list[int]]:
                 rows = tbl.to_pylist()
                 rng.shuffle(rows)
                 for row in rows:
-                    if args.rating_filter and row.get("rating") != args.rating_filter:
-                        continue
-                    if (row.get("score") or 0) < args.min_score:
-                        continue
                     created = row.get("created_at")
-                    year = created.year if (created is not None and hasattr(created, "year")) else None
-                    if args.min_year and (year is None or year < args.min_year):
-                        continue
-                    gen = (row.get("tag_string_general") or "").split()
-                    if len(gen) < 8 or any(t in SKIP_TAGS for t in gen):
-                        continue
-                    w, h = row.get("image_width") or 0, row.get("image_height") or 0
-                    if w < 256 or h < 256:
-                        continue
-                    row["year"] = year
+                    row["year"] = created.year if (created is not None and hasattr(created, "year")) else None
                     row.pop("created_at", None)
                     picked.append(row)
                     if len(picked) >= total_needed:
@@ -699,11 +657,11 @@ def main():
     parser.add_argument("--num-shards", type=int, default=200)
     parser.add_argument("--shard-size", type=int, default=5000)
     parser.add_argument("--variant", type=str, default="turbo")
-    parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--target-res", type=int, default=512)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--cfg", type=float, default=1.0)
-    parser.add_argument("--fp8", action="store_true", default=True)
+    parser.add_argument("--fp8", action="store_true", default=False)
     parser.add_argument("--no-fp8", dest="fp8", action="store_false")
     parser.add_argument("--vae-chunk", type=int, default=6)
     parser.add_argument("--rating-filter", type=str, default="g")

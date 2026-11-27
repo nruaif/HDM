@@ -178,62 +178,27 @@ def prepare_and_plan(args) -> tuple[str, list[int]]:
             pf = pq.ParquetFile(f)
             rgs = list(range(max(0, pf.num_row_groups - 90), pf.num_row_groups))
             rng.shuffle(rgs)
-            for rg in rgs:
-                if len(picked) >= total_needed:
-                    break
-                tbl = pf.read_row_group(rg, columns=cols)
-                rows = tbl.to_pylist()
-                rng.shuffle(rows)
-                for row in rows:
-                    if args.rating_filter and row.get("rating") != args.rating_filter:
-                        continue
-                    if (row.get("score") or 0) < args.min_score:
-                        continue
-                    created = row.get("created_at")
-                    year = created.year if (created is not None and hasattr(created, "year")) else None
-                    if args.min_year and (year is None or year < args.min_year):
-                        continue
-                    gen = (row.get("tag_string_general") or "").split()
-                    if len(gen) < 8 or any(t in SKIP_TAGS for t in gen):
-                        continue
-                    w, h = row.get("image_width") or 0, row.get("image_height") or 0
-                    if w < 256 or h < 256:
-                        continue
-                    row["year"] = year
-                    row.pop("created_at", None)
-                    picked.append(row)
-                    if len(picked) >= total_needed:
-                        break
-            # If 90 row groups wasn't enough for >300k images, sample earlier row groups deterministically
-            if len(picked) < total_needed and pf.num_row_groups > 90:
-                extra_rgs = list(range(0, pf.num_row_groups - 90))
-                rng.shuffle(extra_rgs)
-                for rg in extra_rgs:
+
+            def _collect_from_rgs(rg_list):
+                for rg in rg_list:
                     if len(picked) >= total_needed:
                         break
                     tbl = pf.read_row_group(rg, columns=cols)
                     rows = tbl.to_pylist()
                     rng.shuffle(rows)
                     for row in rows:
-                        if args.rating_filter and row.get("rating") != args.rating_filter:
-                            continue
-                        if (row.get("score") or 0) < args.min_score:
-                            continue
                         created = row.get("created_at")
-                        year = created.year if (created is not None and hasattr(created, "year")) else None
-                        if args.min_year and (year is None or year < args.min_year):
-                            continue
-                        gen = (row.get("tag_string_general") or "").split()
-                        if len(gen) < 8 or any(t in SKIP_TAGS for t in gen):
-                            continue
-                        w, h = row.get("image_width") or 0, row.get("image_height") or 0
-                        if w < 256 or h < 256:
-                            continue
-                        row["year"] = year
+                        row["year"] = created.year if (created is not None and hasattr(created, "year")) else None
                         row.pop("created_at", None)
                         picked.append(row)
                         if len(picked) >= total_needed:
                             break
+
+            _collect_from_rgs(rgs)
+            if len(picked) < total_needed and pf.num_row_groups > 90:
+                extra_rgs = list(range(0, pf.num_row_groups - 90))
+                rng.shuffle(extra_rgs)
+                _collect_from_rgs(extra_rgs)
 
         print(f"Sampled {len(picked):,} prompts.", flush=True)
         for sid in range(args.num_shards):
