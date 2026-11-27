@@ -450,7 +450,7 @@ def parse_args():
     p.add_argument("--compile", action="store_true", default=True)
     p.add_argument("--no_compile", dest="compile", action="store_false")
     p.add_argument("--val_every", type=int, default=0, help="Step-based val interval (0 = eval every epoch when --epochs > 0)")
-    p.add_argument("--save_every", type=int, default=5, help="Epoch interval (when --epochs>0) or step interval to save checkpoints")
+    p.add_argument("--save_every", type=int, default=1, help="Epoch interval (when --epochs>0) or step interval to save checkpoints")
     p.add_argument("--val_steps", type=int, default=24)
     p.add_argument("--val_cfg", type=float, default=3.5)
     p.add_argument("--val_num_prompts", type=int, default=12, help="Number of dataset prompts for validation grid")
