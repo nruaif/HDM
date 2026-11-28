@@ -377,6 +377,7 @@ def cache_wds_shards_to_flux2_latents(
                 item[ext] = tf.extractfile(m).read()
                 img_ext = next((e for e in ("webp", "png", "jpg", "jpeg") if e in item), None)
                 if img_ext and "txt" in item:
+                    bkey = None
                     try:
                         im = Image.open(io.BytesIO(item[img_ext])).convert("RGB")
                         w, h = im.size
@@ -393,8 +394,8 @@ def cache_wds_shards_to_flux2_latents(
                     except Exception:
                         pass
                     pending.pop(key, None)
-                    if img_ext and f"{w16}x{h16}" in buckets_imgs and len(buckets_imgs[f"{w16}x{h16}"]) >= vae_batch_size:
-                        _flush(f"{w16}x{h16}")
+                    if bkey is not None and len(buckets_imgs[bkey]) >= vae_batch_size:
+                        _flush(bkey)
 
         for bkey in list(buckets_imgs.keys()):
             _flush(bkey)
@@ -406,8 +407,13 @@ def cache_wds_shards_to_flux2_latents(
             tensors[f"lat_{bkey}"] = lat
             meta[bkey] = {"count": int(lat.shape[0]), "captions": buckets_caps[bkey]}
 
-        save_file(tensors, str(lat_path))
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        # Atomic write (.tmp -> os.replace) so mid-write crashes never corrupt a cached shard
+        lat_tmp = cache_dir / f"{stem}_latents.safetensors.tmp"
+        meta_tmp = cache_dir / f"{stem}_meta.json.tmp"
+        save_file(tensors, str(lat_tmp))
+        meta_tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        os.replace(lat_tmp, lat_path)
+        os.replace(meta_tmp, meta_path)
         sz_mb = lat_path.stat().st_size / (1024**2)
         print(f"[cache] Saved {stem}: {total_imgs} imgs across {len(meta)} AR buckets ({sz_mb:.1f} MB) in {time.time() - t0:.1f}s", flush=True)
         cached_pairs.append((lat_path, meta_path))
