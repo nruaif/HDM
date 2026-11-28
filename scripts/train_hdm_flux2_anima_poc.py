@@ -936,8 +936,8 @@ def main():
     ).to(device=device, memory_format=torch.channels_last).eval().requires_grad_(False)
     bn_mean, bn_std = get_flux2_bn_stats(vae, device, amp_dtype)
     if args.compile_vae and device.type == "cuda":
-        import torch._dynamo
-        torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, "cache_size_limit", 8), 64)
+        from torch import _dynamo
+        _dynamo.config.cache_size_limit = max(getattr(_dynamo.config, "cache_size_limit", 8), 64)
         print("Compiling FLUX.2 VAE encoder (dynamic=True, channels_last)...", flush=True)
         vae.encoder = torch.compile(vae.encoder, mode="default", dynamic=True)
 
