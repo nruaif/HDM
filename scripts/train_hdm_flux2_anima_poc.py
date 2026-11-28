@@ -1,12 +1,17 @@
 """
-On-the-Fly FLUX.2-VAE PoC Trainer for HDM (XUDiT-340M, 128ch p=1)
-streaming WebDataset .tar shards directly from Hugging Face (0 GB latent cache!).
+FLUX.2-VAE PoC Trainer for HDM (XUDiT-340M, 128ch p=1)
+on `Shio-Koube/anima-turbo-512-wds` (or `Shio-Koube/Anima-gen`).
+
+Supports TWO data modes seamlessly:
+  1. Cached Latents Mode (`--cache_dir ./cache/anima_flux2_latents`, DEFAULT):
+     - Resumable streaming `.tar` -> `AutoencoderKLFlux2` FP16 (or `--cache_dtype fp8`)
+       AR-bucketed `.safetensors` (~1.86 GB/shard FP16, ~0.93 GB/shard FP8, <300 MB RAM during caching).
+     - RAM-safe `ShardStreamingLatentStore` (`--max_ram_shards 8`) so even 50 shards (94 GB)
+       never OOMs 30 GB system RAM, while keeping VAE offloaded to CPU during training!
+  2. Zero-Disk On-the-Fly Mode (`--cache_dir ""`):
+     - Multi-threaded HTTP WebDataset streaming + on-the-fly GPU FLUX.2 VAE encoding (0 GB disk).
 
 Features:
-  - Zero-disk HTTP WebDataset streaming (`Shio-Koube/anima-turbo-512-wds` or `Anima-gen`)
-    with multi-threaded AR-bucketed prefetch queue (GPU never stalls on network/PIL)
-  - On-the-fly `AutoencoderKLFlux2` encoding (`[B, 32, H/8, W/8]` -> patchified
-    `[B, 128, H/16, W/16]` normalized by `vae.bn.running_mean / running_var`)
   - Pretrained `KBlueLeaf/HDM-xut-340M-anime` backbone adapted to `input_dim=128, patch_size=1`
     with 2-stage warmup (train fresh `in_patch`/`out_patch` first, then unfreeze full model)
   - Tier-3 XUDiT optimizations (`compile_blocks(dynamic=True)`, selective `grad_ckpt`,
@@ -14,17 +19,21 @@ Features:
   - Contrastive Flow Matching (DeltaFM, arXiv:2506.05350) after patch warmup
   - W&B logging, clean `XUDiT` safetensors checkpoints, and `--resume` support
 
-Usage (PoC on RTX 5090 / A100 / L40S):
-    export HF_TOKEN=hf_...
+Usage (Cached 4-shard PoC, ~7.4 GB FP16 or ~3.7 GB FP8):
     python3 -u scripts/train_hdm_flux2_anima_poc.py \
         --hf_repo Shio-Koube/anima-turbo-512-wds \
+        --num_shards 4 \
+        --cache_dir /workspace/cache/anima_flux2_latents \
+        --cache_dtype fp16 \
         --steps 5000 \
         --warmup_patch_steps 250 \
         --batch_size 16 \
-        --grad_accum 1 \
         --val_every 500 \
         --save_every 1000 \
         --wandb_project hdm-flux2-poc
+
+Usage (Zero-disk on-the-fly encoding):
+    python3 -u scripts/train_hdm_flux2_anima_poc.py --cache_dir "" ...
 """
 
 import argparse
@@ -301,6 +310,204 @@ def prefetched_wds_batches(
 
 
 # ---------------------------------------------------------------------------
+# 2b. Resumable Offline FLUX.2 Latent Caching + RAM-Safe Chunked Loader
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def cache_wds_shards_to_flux2_latents(
+    hf_repo: str,
+    shard_paths: list[str],
+    cache_dir: Path,
+    vae: AutoencoderKLFlux2,
+    bn_mean: torch.Tensor,
+    bn_std: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    hf_token: str | None = None,
+    vae_batch_size: int = 16,
+    cache_dtype: str = "fp16",
+) -> list[tuple[Path, Path]]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    save_dt = torch.float8_e4m3fn if cache_dtype == "fp8" else torch.float16
+    cached_pairs: list[tuple[Path, Path]] = []
+
+    vae.to(device)
+    for rel_path in shard_paths:
+        stem = Path(rel_path).stem
+        lat_path = cache_dir / f"{stem}_latents.safetensors"
+        meta_path = cache_dir / f"{stem}_meta.json"
+        if lat_path.exists() and meta_path.exists():
+            cached_pairs.append((lat_path, meta_path))
+            continue
+
+        t0 = time.time()
+        print(f"[cache] Downloading & FLUX.2-encoding {rel_path} ({cache_dtype})...", flush=True)
+        local_tar = hf_hub_download(repo_id=hf_repo, filename=rel_path, repo_type="dataset", token=hf_token)
+
+        buckets_imgs: dict[str, list[torch.Tensor]] = defaultdict(list)
+        buckets_lats: dict[str, list[torch.Tensor]] = defaultdict(list)
+        buckets_caps: dict[str, list[str]] = defaultdict(list)
+        total_imgs = 0
+
+        def _flush(bkey: str):
+            imgs = buckets_imgs[bkey]
+            if not imgs:
+                return
+            batch_t = torch.stack(imgs).to(device=device, dtype=amp_dtype)
+            imgs.clear()
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                z = encode_flux2(vae, batch_t, bn_mean, bn_std, sample_mode="sample")
+            if save_dt == torch.float8_e4m3fn:
+                z = z.float().clamp(-448.0, 448.0).to(save_dt)
+            else:
+                z = z.to(save_dt)
+            buckets_lats[bkey].append(z.cpu())
+
+        pending: dict[str, dict] = {}
+        with tarfile.open(local_tar, "r") as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                name = m.name.rsplit("/", 1)[-1]
+                if "." not in name:
+                    continue
+                key, ext = name.rsplit(".", 1)
+                if ext not in ("webp", "png", "jpg", "jpeg", "txt"):
+                    continue
+                item = pending.setdefault(key, {})
+                item[ext] = tf.extractfile(m).read()
+                img_ext = next((e for e in ("webp", "png", "jpg", "jpeg") if e in item), None)
+                if img_ext and "txt" in item:
+                    try:
+                        im = Image.open(io.BytesIO(item[img_ext])).convert("RGB")
+                        w, h = im.size
+                        w16, h16 = (w // 16) * 16, (h // 16) * 16
+                        if w16 < 64 or h16 < 64:
+                            pending.pop(key, None)
+                            continue
+                        if w != w16 or h != h16:
+                            im = im.crop((0, 0, w16, h16))
+                        bkey = f"{w16}x{h16}"
+                        buckets_imgs[bkey].append(pil_to_tensor(im))
+                        buckets_caps[bkey].append(item["txt"].decode("utf-8", errors="replace").strip())
+                        total_imgs += 1
+                    except Exception:
+                        pass
+                    pending.pop(key, None)
+                    if img_ext and f"{w16}x{h16}" in buckets_imgs and len(buckets_imgs[f"{w16}x{h16}"]) >= vae_batch_size:
+                        _flush(f"{w16}x{h16}")
+
+        for bkey in list(buckets_imgs.keys()):
+            _flush(bkey)
+
+        tensors = {}
+        meta = {}
+        for bkey, chunks in buckets_lats.items():
+            lat = torch.cat(chunks, dim=0)
+            tensors[f"lat_{bkey}"] = lat
+            meta[bkey] = {"count": int(lat.shape[0]), "captions": buckets_caps[bkey]}
+
+        save_file(tensors, str(lat_path))
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        sz_mb = lat_path.stat().st_size / (1024**2)
+        print(f"[cache] Saved {stem}: {total_imgs} imgs across {len(meta)} AR buckets ({sz_mb:.1f} MB) in {time.time() - t0:.1f}s", flush=True)
+        cached_pairs.append((lat_path, meta_path))
+
+        # Remove downloaded raw tar from HF cache if possible to save disk
+        try:
+            real_tar = Path(local_tar).resolve()
+            if real_tar.exists():
+                real_tar.unlink()
+        except Exception:
+            pass
+
+    vae.to("cpu")
+    torch.cuda.empty_cache()
+    return cached_pairs
+
+
+class ChunkedFlux2LatentStore:
+    """
+    RAM-safe AR-bucketed FLUX.2 latent store.
+    Loads up to `max_ram_shards` shards at a time (e.g. 8 shards = ~15 GB FP16 or ~7.5 GB FP8),
+    and seamlessly rotates shard chunks if total shards > `max_ram_shards`.
+    """
+
+    def __init__(self, cached_pairs: list[tuple[Path, Path]], max_ram_shards: int = 8):
+        self.cached_pairs = list(cached_pairs)
+        self.max_ram_shards = max(1, max_ram_shards)
+        self.buckets: dict[str, dict] = {}
+        self.bucket_keys: list[str] = []
+        self.bucket_weights: list[int] = []
+        self._chunk_idx = 0
+        self._chunks = [
+            self.cached_pairs[i : i + self.max_ram_shards]
+            for i in range(0, len(self.cached_pairs), self.max_ram_shards)
+        ]
+        self._load_chunk(0)
+
+    def _load_chunk(self, idx: int):
+        self.buckets.clear()
+        self.bucket_keys.clear()
+        self.bucket_weights.clear()
+        pairs = self._chunks[idx % len(self._chunks)]
+        total = 0
+        for lat_path, meta_path in pairs:
+            sd = load_file(str(lat_path), device="cpu")
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            for bkey, info in meta.items():
+                t = sd[f"lat_{bkey}"]  # [N, 128, H/16, W/16] fp16 or fp8
+                if bkey not in self.buckets:
+                    w, h = map(int, bkey.split("x"))
+                    self.buckets[bkey] = {
+                        "latents": [t],
+                        "captions": list(info["captions"]),
+                        "hw_px": (h, w),
+                        "log_ar": math.log(w / h),
+                    }
+                else:
+                    self.buckets[bkey]["latents"].append(t)
+                    self.buckets[bkey]["captions"].extend(info["captions"])
+                total += len(info["captions"])
+        for bkey, b in self.buckets.items():
+            b["latents"] = torch.cat(b["latents"], dim=0)
+            self.bucket_keys.append(bkey)
+            self.bucket_weights.append(len(b["captions"]))
+        print(
+            f"[cache-store] Loaded chunk {(idx % len(self._chunks)) + 1}/{len(self._chunks)} "
+            f"({len(pairs)} shards, {total:,} latents, {len(self.bucket_keys)} AR buckets)",
+            flush=True,
+        )
+
+    def iter_batches(self, batch_size: int, tag_dropout: float = 0.1, seed: int = 42):
+        rng = np.random.default_rng(seed)
+        epoch_idx = 0
+        while True:
+            chunk_order = list(range(len(self._chunks)))
+            rng.shuffle(chunk_order)
+            for cidx in chunk_order:
+                if len(self._chunks) > 1 or epoch_idx > 0:
+                    if len(self._chunks) > 1:
+                        self._load_chunk(cidx)
+                all_batches = []
+                for bkey in self.bucket_keys:
+                    n = len(self.buckets[bkey]["captions"])
+                    perm = rng.permutation(n)
+                    for start in range(0, n - batch_size + 1, batch_size):
+                        all_batches.append((bkey, perm[start : start + batch_size]))
+                rng.shuffle(all_batches)
+                for bkey, idx_arr in all_batches:
+                    b = self.buckets[bkey]
+                    idx_t = torch.from_numpy(idx_arr)
+                    lats = b["latents"][idx_t]
+                    caps = [
+                        normalize_anima_caption(b["captions"][int(i)], tag_shuffle=True, tag_dropout=tag_dropout)
+                        for i in idx_arr
+                    ]
+                    yield lats, caps, b["hw_px"], b["log_ar"]
+            epoch_idx += 1
+
+
+# ---------------------------------------------------------------------------
 # 3. Model Loading (HDM 4ch p=2 -> FLUX.2 128ch p=1), Optimizer & Validation
 # ---------------------------------------------------------------------------
 def clean_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -443,7 +650,12 @@ def run_validation(
         z = z - dt * (uncond + cfg_scale * (cond - uncond))
         t_val -= dt
 
+    vae_was_cpu = next(vae.parameters()).device.type == "cpu"
+    if vae_was_cpu:
+        vae.to(device)
     imgs = decode_flux2(vae, z.to(bn_mean.dtype), bn_mean, bn_std)
+    if vae_was_cpu:
+        vae.to("cpu")
     torch.cuda.empty_cache()
 
     cols = 4 if len(imgs) >= 4 else len(imgs)
@@ -474,10 +686,14 @@ def parse_args():
     p.add_argument("--hdm_repo", type=str, default="KBlueLeaf/HDM-xut-340M-anime")
     p.add_argument("--flux2_vae_repo", type=str, default="black-forest-labs/FLUX.2-dev")
     p.add_argument("--flux2_vae_subfolder", type=str, default="vae")
-    p.add_argument("--num_shards", type=int, default=50, help="Number of WDS shards to stream (0 = all)")
-    p.add_argument("--num_workers", type=int, default=4, help="Concurrent HTTP/PIL prefetch threads")
-    p.add_argument("--queue_size", type=int, default=8, help="Prefetched AR-bucketed batches in RAM")
-    p.add_argument("--vae_chunk_size", type=int, default=0, help="Optional micro-chunk for VAE encode (0 = full batch)")
+    p.add_argument("--num_shards", type=int, default=4, help="Number of WDS shards to cache/stream (0 = all)")
+    p.add_argument("--cache_dir", type=str, default="./cache/anima_flux2_latents", help="Latent cache dir (set '' for zero-disk on-the-fly encoding)")
+    p.add_argument("--cache_dtype", type=str, default="fp16", choices=["fp16", "fp8"], help="Cached latent precision (fp16=~1.86GB/shard, fp8=~0.93GB/shard)")
+    p.add_argument("--max_ram_shards", type=int, default=8, help="Max cached shards kept in RAM at once (prevents RAM OOM)")
+    p.add_argument("--vae_batch_size", type=int, default=16, help="Batch size during offline latent caching")
+    p.add_argument("--num_workers", type=int, default=4, help="Concurrent HTTP/PIL prefetch threads (on-the-fly mode)")
+    p.add_argument("--queue_size", type=int, default=8, help="Prefetched AR-bucketed batches in RAM (on-the-fly mode)")
+    p.add_argument("--vae_chunk_size", type=int, default=0, help="Optional micro-chunk for on-the-fly VAE encode (0 = full batch)")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--steps", type=int, default=5000, help="Total optimizer steps for PoC")
@@ -567,18 +783,37 @@ def main():
         print("Compiling XUDiT blocks (dynamic=True)...", flush=True)
         model.compile_blocks(mode="default", dynamic=True)
 
-    # 3. Start Zero-Disk HTTP WebDataset Prefetcher
+    # 3. Setup Data Source: Cached FLUX.2 Latents (RAM-safe) OR Zero-Disk On-the-Fly Streaming
     shard_paths = list_wds_shards(args.hf_repo, args.num_shards, hf_token)
-    print(f"[stream] Streaming {len(shard_paths)} shards from {args.hf_repo} ({args.num_workers} workers, queue={args.queue_size})...", flush=True)
-    data_iter = prefetched_wds_batches(
-        hf_repo=args.hf_repo,
-        shard_paths=shard_paths,
-        batch_size=args.batch_size,
-        hf_token=hf_token,
-        tag_dropout=args.tag_dropout,
-        num_workers=args.num_workers,
-        queue_size=args.queue_size,
-    )
+    use_cache = bool(args.cache_dir and args.cache_dir.strip())
+    if use_cache:
+        print(f"[mode] CACHED FLUX.2 latents ({args.cache_dtype}) -> {args.cache_dir} ({len(shard_paths)} shards, max_ram_shards={args.max_ram_shards})", flush=True)
+        cached_pairs = cache_wds_shards_to_flux2_latents(
+            hf_repo=args.hf_repo,
+            shard_paths=shard_paths,
+            cache_dir=Path(args.cache_dir),
+            vae=vae,
+            bn_mean=bn_mean,
+            bn_std=bn_std,
+            device=device,
+            amp_dtype=amp_dtype,
+            hf_token=hf_token,
+            vae_batch_size=args.vae_batch_size,
+            cache_dtype=args.cache_dtype,
+        )
+        store = ChunkedFlux2LatentStore(cached_pairs, max_ram_shards=args.max_ram_shards)
+        data_iter = store.iter_batches(args.batch_size, tag_dropout=args.tag_dropout, seed=args.seed)
+    else:
+        print(f"[mode] ZERO-DISK ON-THE-FLY FLUX.2 encoding: streaming {len(shard_paths)} shards ({args.num_workers} workers, queue={args.queue_size})...", flush=True)
+        data_iter = prefetched_wds_batches(
+            hf_repo=args.hf_repo,
+            shard_paths=shard_paths,
+            batch_size=args.batch_size,
+            hf_token=hf_token,
+            tag_dropout=args.tag_dropout,
+            num_workers=args.num_workers,
+            queue_size=args.queue_size,
+        )
 
     val_prompts = load_val_prompts(args.val_prompts_file)
     (out_dir / "val_prompts.txt").write_text("\n".join(f"[{i+1}] {p}" for i, p in enumerate(val_prompts)), encoding="utf-8")
@@ -635,13 +870,15 @@ def main():
         use_dfm = (not in_warmup) and (args.delta_fm_lambda > 0.0)
 
         for _ in range(args.grad_accum):
-            imgs_cpu, captions, (h_px, w_px), log_ar = next(data_iter)
-            b = imgs_cpu.shape[0]
-            imgs = imgs_cpu.to(device=device, dtype=amp_dtype, non_blocking=True)
-
-            # On-the-fly FLUX.2 VAE encode -> [B, 128, H/16, W/16]
-            with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                latents = encode_flux2(vae, imgs, bn_mean, bn_std, sample_mode="sample", chunk_size=args.vae_chunk_size)
+            batch_x, captions, (h_px, w_px), log_ar = next(data_iter)
+            b = batch_x.shape[0]
+            if use_cache:
+                latents = batch_x.to(device=device, dtype=torch.float32, non_blocking=True)
+            else:
+                imgs = batch_x.to(device=device, dtype=amp_dtype, non_blocking=True)
+                # On-the-fly FLUX.2 VAE encode -> [B, 128, H/16, W/16]
+                with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                    latents = encode_flux2(vae, imgs, bn_mean, bn_std, sample_mode="sample", chunk_size=args.vae_chunk_size)
 
             captions_drop = ["" if random.random() < 0.1 else c for c in captions]
             toks = tokenizer(captions_drop, padding="longest", truncation=True, max_length=args.max_ctx_len, return_tensors="pt")
