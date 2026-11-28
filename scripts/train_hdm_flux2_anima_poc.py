@@ -50,6 +50,7 @@ import threading
 import time
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -312,6 +313,21 @@ def prefetched_wds_batches(
 # ---------------------------------------------------------------------------
 # 2b. Resumable Offline FLUX.2 Latent Caching + RAM-Safe Chunked Loader
 # ---------------------------------------------------------------------------
+def _decode_raw_pair(pair: tuple[bytes, bytes]):
+    img_bytes, txt_bytes = pair
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        w16, h16 = (w // 16) * 16, (h // 16) * 16
+        if w16 < 64 or h16 < 64:
+            return None
+        if w != w16 or h != h16:
+            im = im.crop((0, 0, w16, h16))
+        return f"{w16}x{h16}", pil_to_tensor(im), txt_bytes.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+
 @torch.no_grad()
 def cache_wds_shards_to_flux2_latents(
     hf_repo: str,
@@ -323,112 +339,152 @@ def cache_wds_shards_to_flux2_latents(
     device: torch.device,
     amp_dtype: torch.dtype,
     hf_token: str | None = None,
-    vae_batch_size: int = 16,
+    vae_batch_size: int = 32,
     cache_dtype: str = "fp16",
+    decode_workers: int = 4,
 ) -> list[tuple[Path, Path]]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     save_dt = torch.float8_e4m3fn if cache_dtype == "fp8" else torch.float16
     cached_pairs: list[tuple[Path, Path]] = []
 
-    vae.to(device)
+    # Separate already-cached shards from shards that still need encoding
+    todo_shards: list[str] = []
     for rel_path in shard_paths:
         stem = Path(rel_path).stem
         lat_path = cache_dir / f"{stem}_latents.safetensors"
         meta_path = cache_dir / f"{stem}_meta.json"
         if lat_path.exists() and meta_path.exists():
             cached_pairs.append((lat_path, meta_path))
-            continue
+        else:
+            todo_shards.append(rel_path)
 
-        t0 = time.time()
-        print(f"[cache] Downloading & FLUX.2-encoding {rel_path} ({cache_dtype})...", flush=True)
-        local_tar = hf_hub_download(repo_id=hf_repo, filename=rel_path, repo_type="dataset", token=hf_token)
+    if not todo_shards:
+        print(f"[cache] All {len(cached_pairs)} shards already cached in {cache_dir}.", flush=True)
+        vae.to("cpu")
+        torch.cuda.empty_cache()
+        return cached_pairs
 
-        buckets_imgs: dict[str, list[torch.Tensor]] = defaultdict(list)
-        buckets_lats: dict[str, list[torch.Tensor]] = defaultdict(list)
-        buckets_caps: dict[str, list[str]] = defaultdict(list)
-        total_imgs = 0
+    print(
+        f"[cache] Found {len(cached_pairs)} cached shard(s); encoding {len(todo_shards)} remaining "
+        f"(vae_bs={vae_batch_size}, decode_workers={decode_workers}, dtype={cache_dtype})...",
+        flush=True,
+    )
+    vae.to(device=device, memory_format=torch.channels_last)
 
-        def _flush(bkey: str):
-            imgs = buckets_imgs[bkey]
-            if not imgs:
-                return
-            batch_t = torch.stack(imgs).to(device=device, dtype=amp_dtype)
-            imgs.clear()
-            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                z = encode_flux2(vae, batch_t, bn_mean, bn_std, sample_mode="sample")
-            if save_dt == torch.float8_e4m3fn:
-                z = z.float().clamp(-448.0, 448.0).to(save_dt)
-            else:
-                z = z.to(save_dt)
-            buckets_lats[bkey].append(z.cpu())
+    def _download(rel_path: str) -> str:
+        return hf_hub_download(repo_id=hf_repo, filename=rel_path, repo_type="dataset", token=hf_token)
 
-        pending: dict[str, dict] = {}
-        with tarfile.open(local_tar, "r") as tf:
-            for m in tf:
-                if not m.isfile():
-                    continue
-                name = m.name.rsplit("/", 1)[-1]
-                if "." not in name:
-                    continue
-                key, ext = name.rsplit(".", 1)
-                if ext not in ("webp", "png", "jpg", "jpeg", "txt"):
-                    continue
-                item = pending.setdefault(key, {})
-                item[ext] = tf.extractfile(m).read()
-                img_ext = next((e for e in ("webp", "png", "jpg", "jpeg") if e in item), None)
-                if img_ext and "txt" in item:
-                    bkey = None
-                    try:
-                        im = Image.open(io.BytesIO(item[img_ext])).convert("RGB")
-                        w, h = im.size
-                        w16, h16 = (w // 16) * 16, (h // 16) * 16
-                        if w16 < 64 or h16 < 64:
-                            pending.pop(key, None)
-                            continue
-                        if w != w16 or h != h16:
-                            im = im.crop((0, 0, w16, h16))
-                        bkey = f"{w16}x{h16}"
-                        buckets_imgs[bkey].append(pil_to_tensor(im))
-                        buckets_caps[bkey].append(item["txt"].decode("utf-8", errors="replace").strip())
-                        total_imgs += 1
-                    except Exception:
-                        pass
-                    pending.pop(key, None)
-                    if bkey is not None and len(buckets_imgs[bkey]) >= vae_batch_size:
+    decode_chunk = max(vae_batch_size * 4, 64)
+    with ThreadPoolExecutor(max_workers=1) as dl_pool, ThreadPoolExecutor(max_workers=max(1, decode_workers)) as dec_pool:
+        # Prefetch first shard immediately
+        next_fut = dl_pool.submit(_download, todo_shards[0])
+
+        for idx, rel_path in enumerate(todo_shards):
+            stem = Path(rel_path).stem
+            lat_path = cache_dir / f"{stem}_latents.safetensors"
+            meta_path = cache_dir / f"{stem}_meta.json"
+            t0 = time.time()
+
+            local_tar = next_fut.result()
+            # Start downloading next shard in background while GPU encodes current shard
+            if idx + 1 < len(todo_shards):
+                next_fut = dl_pool.submit(_download, todo_shards[idx + 1])
+
+            print(f"[cache] Encoding {rel_path} ({idx + 1}/{len(todo_shards)}, {cache_dtype})...", flush=True)
+            buckets_imgs: dict[str, list[torch.Tensor]] = defaultdict(list)
+            buckets_lats: dict[str, list[torch.Tensor]] = defaultdict(list)
+            buckets_caps: dict[str, list[str]] = defaultdict(list)
+            total_imgs = 0
+
+            def _flush(bkey: str):
+                imgs = buckets_imgs[bkey]
+                if not imgs:
+                    return
+                batch_t = torch.stack(imgs).to(
+                    device=device, dtype=amp_dtype, memory_format=torch.channels_last, non_blocking=True
+                )
+                imgs.clear()
+                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                    z = encode_flux2(vae, batch_t, bn_mean, bn_std, sample_mode="sample")
+                if save_dt == torch.float8_e4m3fn:
+                    z = z.float().clamp(-448.0, 448.0).to(save_dt)
+                else:
+                    z = z.to(save_dt)
+                buckets_lats[bkey].append(z.cpu())
+
+            def _process_raw_batch(raw_pairs: list[tuple[bytes, bytes]]):
+                nonlocal total_imgs
+                if not raw_pairs:
+                    return
+                for res in dec_pool.map(_decode_raw_pair, raw_pairs):
+                    if res is None:
+                        continue
+                    bkey, img_t, cap = res
+                    buckets_imgs[bkey].append(img_t)
+                    buckets_caps[bkey].append(cap)
+                    total_imgs += 1
+                    if len(buckets_imgs[bkey]) >= vae_batch_size:
                         _flush(bkey)
+                raw_pairs.clear()
 
-        for bkey in list(buckets_imgs.keys()):
-            _flush(bkey)
+            pending: dict[str, dict] = {}
+            raw_pairs: list[tuple[bytes, bytes]] = []
+            with tarfile.open(local_tar, "r") as tf:
+                for m in tf:
+                    if not m.isfile():
+                        continue
+                    name = m.name.rsplit("/", 1)[-1]
+                    if "." not in name:
+                        continue
+                    key, ext = name.rsplit(".", 1)
+                    if ext not in ("webp", "png", "jpg", "jpeg", "txt"):
+                        continue
+                    item = pending.setdefault(key, {})
+                    item[ext] = tf.extractfile(m).read()
+                    img_ext = next((e for e in ("webp", "png", "jpg", "jpeg") if e in item), None)
+                    if img_ext and "txt" in item:
+                        raw_pairs.append((item[img_ext], item["txt"]))
+                        pending.pop(key, None)
+                        if len(raw_pairs) >= decode_chunk:
+                            _process_raw_batch(raw_pairs)
 
-        tensors = {}
-        meta = {}
-        for bkey, chunks in buckets_lats.items():
-            lat = torch.cat(chunks, dim=0)
-            tensors[f"lat_{bkey}"] = lat
-            meta[bkey] = {"count": int(lat.shape[0]), "captions": buckets_caps[bkey]}
+            _process_raw_batch(raw_pairs)
+            for bkey in list(buckets_imgs.keys()):
+                _flush(bkey)
 
-        # Atomic write (.tmp -> os.replace) so mid-write crashes never corrupt a cached shard
-        lat_tmp = cache_dir / f"{stem}_latents.safetensors.tmp"
-        meta_tmp = cache_dir / f"{stem}_meta.json.tmp"
-        save_file(tensors, str(lat_tmp))
-        meta_tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-        os.replace(lat_tmp, lat_path)
-        os.replace(meta_tmp, meta_path)
-        sz_mb = lat_path.stat().st_size / (1024**2)
-        print(f"[cache] Saved {stem}: {total_imgs} imgs across {len(meta)} AR buckets ({sz_mb:.1f} MB) in {time.time() - t0:.1f}s", flush=True)
-        cached_pairs.append((lat_path, meta_path))
+            tensors = {}
+            meta = {}
+            for bkey, chunks in buckets_lats.items():
+                lat = torch.cat(chunks, dim=0)
+                tensors[f"lat_{bkey}"] = lat
+                meta[bkey] = {"count": int(lat.shape[0]), "captions": buckets_caps[bkey]}
 
-        # Remove downloaded raw tar from HF cache if possible to save disk
-        try:
-            real_tar = Path(local_tar).resolve()
-            if real_tar.exists():
-                real_tar.unlink()
-        except Exception:
-            pass
+            # Atomic write (.tmp -> os.replace) so mid-write crashes never corrupt a cached shard
+            lat_tmp = cache_dir / f"{stem}_latents.safetensors.tmp"
+            meta_tmp = cache_dir / f"{stem}_meta.json.tmp"
+            save_file(tensors, str(lat_tmp))
+            meta_tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+            os.replace(lat_tmp, lat_path)
+            os.replace(meta_tmp, meta_path)
+            sz_mb = lat_path.stat().st_size / (1024**2)
+            print(f"[cache] Saved {stem}: {total_imgs} imgs across {len(meta)} AR buckets ({sz_mb:.1f} MB) in {time.time() - t0:.1f}s", flush=True)
+            cached_pairs.append((lat_path, meta_path))
+
+            # Remove downloaded raw tar from HF cache to save disk
+            try:
+                real_tar = Path(local_tar).resolve()
+                if real_tar.exists():
+                    real_tar.unlink()
+            except Exception:
+                pass
+
+    # Keep deterministic shard order matching shard_paths
+    pair_by_stem = {lat_p.stem.replace("_latents", ""): (lat_p, meta_p) for lat_p, meta_p in cached_pairs}
+    ordered_pairs = [pair_by_stem[Path(rp).stem] for rp in shard_paths if Path(rp).stem in pair_by_stem]
 
     vae.to("cpu")
     torch.cuda.empty_cache()
-    return cached_pairs
+    return ordered_pairs
 
 
 class ChunkedFlux2LatentStore:
@@ -789,7 +845,10 @@ def parse_args():
     p.add_argument("--cache_dir", type=str, default="./cache/anima_flux2_latents", help="Latent cache dir (set '' for zero-disk on-the-fly encoding)")
     p.add_argument("--cache_dtype", type=str, default="fp16", choices=["fp16", "fp8"], help="Cached latent precision (fp16=~1.86GB/shard, fp8=~0.93GB/shard)")
     p.add_argument("--max_ram_shards", type=int, default=8, help="Max cached shards kept in RAM at once (prevents RAM OOM)")
-    p.add_argument("--vae_batch_size", type=int, default=16, help="Batch size during offline latent caching")
+    p.add_argument("--vae_batch_size", type=int, default=32, help="Batch size during offline latent caching")
+    p.add_argument("--decode_workers", type=int, default=4, help="Parallel PIL image decode threads during caching")
+    p.add_argument("--compile_vae", action="store_true", default=True, help="torch.compile(vae.encoder, dynamic=True) + channels_last")
+    p.add_argument("--no_compile_vae", dest="compile_vae", action="store_false")
     p.add_argument("--num_workers", type=int, default=4, help="Concurrent HTTP/PIL prefetch threads (on-the-fly mode)")
     p.add_argument("--queue_size", type=int, default=8, help="Prefetched AR-bucketed batches in RAM (on-the-fly mode)")
     p.add_argument("--vae_chunk_size", type=int, default=0, help="Optional micro-chunk for on-the-fly VAE encode (0 = full batch)")
@@ -867,32 +926,22 @@ def main():
         wb = wandb.init(**wb_kwargs)
         print(f"W&B run initialized: {wb.url}", flush=True)
 
-    # 1. Load FLUX.2 VAE (stays on GPU in amp_dtype for fast on-the-fly encoding)
+    # 1. Load FLUX.2 VAE (channels_last + optional torch.compile(encoder) for fast caching/encoding)
     print(f"Loading FLUX.2 VAE from {args.flux2_vae_repo}/{args.flux2_vae_subfolder}...", flush=True)
     vae = AutoencoderKLFlux2.from_pretrained(
         args.flux2_vae_repo,
         subfolder=args.flux2_vae_subfolder,
         torch_dtype=amp_dtype,
         token=hf_token,
-    ).to(device).eval().requires_grad_(False)
+    ).to(device=device, memory_format=torch.channels_last).eval().requires_grad_(False)
     bn_mean, bn_std = get_flux2_bn_stats(vae, device, amp_dtype)
+    if args.compile_vae and device.type == "cuda":
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, "cache_size_limit", 8), 64)
+        print("Compiling FLUX.2 VAE encoder (dynamic=True, channels_last)...", flush=True)
+        vae.encoder = torch.compile(vae.encoder, mode="default", dynamic=True)
 
-    # 2. Load Qwen3-0.6B Text Encoder + FLUX.2-adapted HDM-340M
-    tokenizer = AutoTokenizer.from_pretrained(args.hdm_repo, subfolder="tokenizer")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    text_encoder = Qwen3Model.from_pretrained(
-        args.hdm_repo, subfolder="text_encoder", torch_dtype=amp_dtype
-    ).to(device).eval().requires_grad_(False)
-
-    model = load_hdm_for_flux2(args.hdm_repo, device=device, grad_ckpt=grad_ckpt, resume_path=args.resume)
-    if getattr(model, "use_tread", False):
-        model.dropout_ratio = args.tread_rate
-    if args.compile and device.type == "cuda":
-        print("Compiling XUDiT blocks (dynamic=True)...", flush=True)
-        model.compile_blocks(mode="default", dynamic=True)
-
-    # 3. Setup Data Source: Cached FLUX.2 Latents (RAM-safe) OR Zero-Disk On-the-Fly Streaming
+    # 2. Setup Data Source BEFORE loading Transformer/TextEncoder so VAE caching gets full VRAM
     shard_paths = list_wds_shards(args.hf_repo, args.num_shards, hf_token)
     use_cache = bool(args.cache_dir and args.cache_dir.strip())
     store = None
@@ -911,6 +960,7 @@ def main():
             hf_token=hf_token,
             vae_batch_size=args.vae_batch_size,
             cache_dtype=args.cache_dtype,
+            decode_workers=args.decode_workers,
         )
         store = ChunkedFlux2LatentStore(cached_pairs, max_ram_shards=args.max_ram_shards)
     else:
@@ -924,6 +974,21 @@ def main():
             num_workers=args.num_workers,
             queue_size=args.queue_size,
         )
+
+    # 3. Load Qwen3-0.6B Text Encoder + FLUX.2-adapted HDM-340M
+    tokenizer = AutoTokenizer.from_pretrained(args.hdm_repo, subfolder="tokenizer")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    text_encoder = Qwen3Model.from_pretrained(
+        args.hdm_repo, subfolder="text_encoder", torch_dtype=amp_dtype
+    ).to(device).eval().requires_grad_(False)
+
+    model = load_hdm_for_flux2(args.hdm_repo, device=device, grad_ckpt=grad_ckpt, resume_path=args.resume)
+    if getattr(model, "use_tread", False):
+        model.dropout_ratio = args.tread_rate
+    if args.compile and device.type == "cuda":
+        print("Compiling XUDiT blocks (dynamic=True)...", flush=True)
+        model.compile_blocks(mode="default", dynamic=True)
 
     if args.val_prompts_file and Path(args.val_prompts_file).exists():
         val_prompts = load_val_prompts(args.val_prompts_file)
@@ -967,7 +1032,7 @@ def main():
         if use_cache:
             latents = batch_x.to(device=device, dtype=torch.float32, non_blocking=True)
         else:
-            imgs = batch_x.to(device=device, dtype=amp_dtype, non_blocking=True)
+            imgs = batch_x.to(device=device, dtype=amp_dtype, memory_format=torch.channels_last, non_blocking=True)
             with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 latents = encode_flux2(vae, imgs, bn_mean, bn_std, sample_mode="sample", chunk_size=args.vae_chunk_size)
 
