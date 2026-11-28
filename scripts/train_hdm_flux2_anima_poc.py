@@ -438,18 +438,41 @@ class ChunkedFlux2LatentStore:
         self.buckets: dict[str, dict] = {}
         self.bucket_keys: list[str] = []
         self.bucket_weights: list[int] = []
-        self._chunk_idx = 0
+        self._loaded_chunk_idx = -1
         self._chunks = [
             self.cached_pairs[i : i + self.max_ram_shards]
             for i in range(0, len(self.cached_pairs), self.max_ram_shards)
         ]
+        # Fast metadata pre-scan across all shards so epoch batch count & val prompts are exact
+        self._chunk_bucket_counts: list[dict[str, int]] = []
+        self._all_bucket_keys: set[str] = set()
+        total_imgs = 0
+        for chunk in self._chunks:
+            counts: dict[str, int] = defaultdict(int)
+            for _, meta_path in chunk:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                for bkey, info in meta.items():
+                    c = len(info["captions"])
+                    counts[bkey] += c
+                    total_imgs += c
+                    self._all_bucket_keys.add(bkey)
+            self._chunk_bucket_counts.append(dict(counts))
+        self.total_images = total_imgs
+        print(
+            f"[cache-store] Indexed {total_imgs:,} cached FLUX.2 latents across {len(self.cached_pairs)} shards "
+            f"({len(self._chunks)} RAM chunk(s), {len(self._all_bucket_keys)} AR buckets).",
+            flush=True,
+        )
         self._load_chunk(0)
 
     def _load_chunk(self, idx: int):
+        idx = idx % len(self._chunks)
+        if idx == self._loaded_chunk_idx:
+            return
         self.buckets.clear()
         self.bucket_keys.clear()
         self.bucket_weights.clear()
-        pairs = self._chunks[idx % len(self._chunks)]
+        pairs = self._chunks[idx]
         total = 0
         for lat_path, meta_path in pairs:
             sd = load_file(str(lat_path), device="cpu")
@@ -472,39 +495,60 @@ class ChunkedFlux2LatentStore:
             b["latents"] = torch.cat(b["latents"], dim=0)
             self.bucket_keys.append(bkey)
             self.bucket_weights.append(len(b["captions"]))
+        self._loaded_chunk_idx = idx
         print(
-            f"[cache-store] Loaded chunk {(idx % len(self._chunks)) + 1}/{len(self._chunks)} "
+            f"[cache-store] Loaded chunk {idx + 1}/{len(self._chunks)} "
             f"({len(pairs)} shards, {total:,} latents, {len(self.bucket_keys)} AR buckets)",
             flush=True,
         )
 
-    def iter_batches(self, batch_size: int, tag_dropout: float = 0.1, seed: int = 42):
+    def epoch_num_batches(self, batch_size: int) -> int:
+        return sum(
+            c // batch_size
+            for counts in self._chunk_bucket_counts
+            for c in counts.values()
+        )
+
+    def sample_val_prompts(self, n: int = 12, seed: int = 42) -> list[str]:
+        rng = random.Random(seed)
+        prompts = []
+        keys = sorted(self.bucket_keys)
+        for i in range(n):
+            bkey = keys[i % len(keys)]
+            caps = self.buckets[bkey]["captions"]
+            raw = caps[rng.randrange(len(caps))]
+            prompts.append(normalize_anima_caption(raw, tag_shuffle=False, tag_dropout=0.0))
+        return prompts
+
+    def iter_epoch_batches(self, batch_size: int, seed: int = 42, tag_dropout: float = 0.1):
+        """Yield shuffled homogeneous-AR batches covering 1 full epoch across all cached chunks."""
         rng = np.random.default_rng(seed)
-        epoch_idx = 0
+        chunk_order = list(range(len(self._chunks)))
+        rng.shuffle(chunk_order)
+        for cidx in chunk_order:
+            self._load_chunk(int(cidx))
+            all_batches = []
+            for bkey in self.bucket_keys:
+                n = len(self.buckets[bkey]["captions"])
+                perm = rng.permutation(n)
+                for start in range(0, n - batch_size + 1, batch_size):
+                    all_batches.append((bkey, perm[start : start + batch_size]))
+            rng.shuffle(all_batches)
+            for bkey, idx_arr in all_batches:
+                b = self.buckets[bkey]
+                idx_t = torch.from_numpy(idx_arr)
+                lats = b["latents"][idx_t]
+                caps = [
+                    normalize_anima_caption(b["captions"][int(i)], tag_shuffle=True, tag_dropout=tag_dropout)
+                    for i in idx_arr
+                ]
+                yield lats, caps, b["hw_px"], b["log_ar"]
+
+    def iter_batches(self, batch_size: int, tag_dropout: float = 0.1, seed: int = 42):
+        ep = 0
         while True:
-            chunk_order = list(range(len(self._chunks)))
-            rng.shuffle(chunk_order)
-            for cidx in chunk_order:
-                if len(self._chunks) > 1 or epoch_idx > 0:
-                    if len(self._chunks) > 1:
-                        self._load_chunk(cidx)
-                all_batches = []
-                for bkey in self.bucket_keys:
-                    n = len(self.buckets[bkey]["captions"])
-                    perm = rng.permutation(n)
-                    for start in range(0, n - batch_size + 1, batch_size):
-                        all_batches.append((bkey, perm[start : start + batch_size]))
-                rng.shuffle(all_batches)
-                for bkey, idx_arr in all_batches:
-                    b = self.buckets[bkey]
-                    idx_t = torch.from_numpy(idx_arr)
-                    lats = b["latents"][idx_t]
-                    caps = [
-                        normalize_anima_caption(b["captions"][int(i)], tag_shuffle=True, tag_dropout=tag_dropout)
-                        for i in idx_arr
-                    ]
-                    yield lats, caps, b["hw_px"], b["log_ar"]
-            epoch_idx += 1
+            yield from self.iter_epoch_batches(batch_size, seed=seed + ep, tag_dropout=tag_dropout)
+            ep += 1
 
 
 # ---------------------------------------------------------------------------
@@ -591,12 +635,61 @@ def build_mup_optimizer(
     return torch.optim.AdamW(param_groups, lr=base_lr, betas=(0.9, 0.98), fused=use_cuda)
 
 
-def set_backbone_trainable(model: nn.Module, trainable: bool):
-    for name, param in model.named_parameters():
-        if "in_patch" in name or "out_patch" in name:
+def get_ordered_transformer_blocks(model: XUDiT) -> list[tuple[str, nn.Module]]:
+    """Return all TransformerBlocks in forward execution order."""
+    blocks: list[tuple[str, nn.Module]] = []
+    if getattr(model, "use_tread", False):
+        for i, blk in enumerate(model.prev_tread_trns.blocks):
+            blocks.append((f"prev_tread_trns.blocks.{i}", blk))
+    if hasattr(model.backbone, "enc_blocks"):
+        for s, stage in enumerate(model.backbone.enc_blocks):
+            for i, blk in enumerate(stage):
+                blocks.append((f"backbone.enc_blocks.{s}.{i}", blk))
+        for s, stage in enumerate(model.backbone.dec_blocks):
+            for i, blk in enumerate(stage):
+                blocks.append((f"backbone.dec_blocks.{s}.{i}", blk))
+    elif hasattr(model.backbone, "blocks"):
+        for i, blk in enumerate(model.backbone.blocks):
+            blocks.append((f"backbone.blocks.{i}", blk))
+    if getattr(model, "use_tread", False):
+        for i, blk in enumerate(model.post_tread_trns.blocks):
+            blocks.append((f"post_tread_trns.blocks.{i}", blk))
+    return blocks
+
+
+def set_warmup_trainable(model: XUDiT, warmup: bool, num_edge_layers: int = 2):
+    """
+    Stage 1 (`warmup=True`): unfreeze `in_patch`, `out_patch`, plus the first `num_edge_layers`
+    and last `num_edge_layers` transformer blocks in forward order; freeze all middle layers.
+    Stage 2 (`warmup=False`): unfreeze the entire model.
+    """
+    if not warmup:
+        for param in model.parameters():
             param.requires_grad_(True)
-        else:
-            param.requires_grad_(trainable)
+        n_tot = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[trainable] Stage 2: unfroze ALL parameters ({n_tot / 1e6:.2f}M trainable).", flush=True)
+        return
+
+    ordered = get_ordered_transformer_blocks(model)
+    first_blks = ordered[:num_edge_layers] if num_edge_layers > 0 else []
+    last_blks = ordered[-num_edge_layers:] if num_edge_layers > 0 else []
+    unfrozen_modules: list[tuple[str, nn.Module]] = [
+        ("in_patch", model.in_patch),
+        ("out_patch", model.out_patch),
+        *first_blks,
+        *last_blks,
+    ]
+    unfrozen_param_ids = {id(p) for _, mod in unfrozen_modules for p in mod.parameters()}
+    for param in model.parameters():
+        param.requires_grad_(id(param) in unfrozen_param_ids)
+
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    names = [name for name, _ in unfrozen_modules]
+    print(
+        f"[trainable] Stage 1 warmup: unfroze {n_train / 1e6:.2f}M / {n_all / 1e6:.2f}M params -> {names}",
+        flush=True,
+    )
 
 
 @torch.no_grad()
@@ -696,8 +789,12 @@ def parse_args():
     p.add_argument("--vae_chunk_size", type=int, default=0, help="Optional micro-chunk for on-the-fly VAE encode (0 = full batch)")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--steps", type=int, default=5000, help="Total optimizer steps for PoC")
-    p.add_argument("--warmup_patch_steps", type=int, default=250, help="Steps to train ONLY in_patch/out_patch first (0 to disable)")
+    p.add_argument("--epochs", type=int, default=100, help="Number of full dataset epochs (>0 overrides --steps)")
+    p.add_argument("--start_epoch", type=int, default=1, help="Starting epoch index when resuming")
+    p.add_argument("--steps", type=int, default=0, help="Optional fixed step count (used only if --epochs 0)")
+    p.add_argument("--steps_per_epoch", type=int, default=0, help="Override batches/epoch for zero-disk streaming mode (0 = num_shards*5000//batch_size)")
+    p.add_argument("--warmup_patch_steps", type=int, default=250, help="Stage-1 warmup steps (unfreezes in_patch, out_patch + first/last N layers; 0 to disable)")
+    p.add_argument("--warmup_edge_layers", type=int, default=2, help="Number of first and last transformer layers unfrozen during warmup_patch_steps")
     p.add_argument("--lr", type=float, default=0.05, help="Base muP LR (divides by fan_in)")
     p.add_argument("--patch_lr_mult", type=float, default=3.0, help="Extra LR multiplier on fresh 128ch in_patch/out_patch")
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -710,14 +807,16 @@ def parse_args():
     p.add_argument("--no_compile", dest="compile", action="store_false")
     p.add_argument("--resume", type=str, default="", help="Optional FLUX.2-adapted .safetensors checkpoint to resume")
     p.add_argument("--val_prompts_file", type=str, default="", help="Optional val_prompts.txt to reuse exact prompts")
+    p.add_argument("--val_num_prompts", type=int, default=12, help="Number of dataset prompts for validation grid (when --val_prompts_file is unset)")
     p.add_argument("--val_res", type=int, default=512)
-    p.add_argument("--val_every", type=int, default=500)
-    p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument("--val_every", type=int, default=0, help="Step-based val interval (0 = validate every epoch when --epochs > 0)")
+    p.add_argument("--save_every", type=int, default=1, help="Epoch interval (when --epochs > 0) or step interval to save checkpoints")
     p.add_argument("--val_steps", type=int, default=24)
     p.add_argument("--val_cfg", type=float, default=3.5)
     p.add_argument("--out_dir", type=str, default="./outputs/hdm_flux2_anima_poc")
     p.add_argument("--wandb_project", type=str, default="")
     p.add_argument("--wandb_run_name", type=str, default="")
+    p.add_argument("--wandb_run_id", type=str, default="", help="Optional W&B run ID to resume")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -755,7 +854,11 @@ def main():
     wb = None
     if args.wandb_project:
         import wandb
-        wb = wandb.init(project=args.wandb_project, name=args.wandb_run_name or None, config=vars(args))
+        wb_kwargs = dict(project=args.wandb_project, name=args.wandb_run_name or None, config=vars(args))
+        if args.wandb_run_id:
+            wb_kwargs["id"] = args.wandb_run_id
+            wb_kwargs["resume"] = "allow"
+        wb = wandb.init(**wb_kwargs)
         print(f"W&B run initialized: {wb.url}", flush=True)
 
     # 1. Load FLUX.2 VAE (stays on GPU in amp_dtype for fast on-the-fly encoding)
@@ -786,6 +889,8 @@ def main():
     # 3. Setup Data Source: Cached FLUX.2 Latents (RAM-safe) OR Zero-Disk On-the-Fly Streaming
     shard_paths = list_wds_shards(args.hf_repo, args.num_shards, hf_token)
     use_cache = bool(args.cache_dir and args.cache_dir.strip())
+    store = None
+    stream_iter = None
     if use_cache:
         print(f"[mode] CACHED FLUX.2 latents ({args.cache_dtype}) -> {args.cache_dir} ({len(shard_paths)} shards, max_ram_shards={args.max_ram_shards})", flush=True)
         cached_pairs = cache_wds_shards_to_flux2_latents(
@@ -802,10 +907,9 @@ def main():
             cache_dtype=args.cache_dtype,
         )
         store = ChunkedFlux2LatentStore(cached_pairs, max_ram_shards=args.max_ram_shards)
-        data_iter = store.iter_batches(args.batch_size, tag_dropout=args.tag_dropout, seed=args.seed)
     else:
         print(f"[mode] ZERO-DISK ON-THE-FLY FLUX.2 encoding: streaming {len(shard_paths)} shards ({args.num_workers} workers, queue={args.queue_size})...", flush=True)
-        data_iter = prefetched_wds_batches(
+        stream_iter = prefetched_wds_batches(
             hf_repo=args.hf_repo,
             shard_paths=shard_paths,
             batch_size=args.batch_size,
@@ -815,7 +919,12 @@ def main():
             queue_size=args.queue_size,
         )
 
-    val_prompts = load_val_prompts(args.val_prompts_file)
+    if args.val_prompts_file and Path(args.val_prompts_file).exists():
+        val_prompts = load_val_prompts(args.val_prompts_file)
+    elif store is not None:
+        val_prompts = store.sample_val_prompts(n=args.val_num_prompts, seed=args.seed)
+    else:
+        val_prompts = list(VAL_PROMPTS)
     (out_dir / "val_prompts.txt").write_text("\n".join(f"[{i+1}] {p}" for i, p in enumerate(val_prompts)), encoding="utf-8")
 
     # Cache axial pos_maps per (H/16, W/16) bucket on GPU
@@ -829,13 +938,9 @@ def main():
             pos_map_cache[key] = pm
         return pm.unsqueeze(0).expand(b, -1, -1)
 
-    # 4. Stage 1 (Patch Warmup) vs Stage 2 (Full Fine-tune + DeltaFM)
+    # 4. Stage 1 (Patch + First/Last N Layers Warmup) vs Stage 2 (Full Fine-tune + DeltaFM)
     in_warmup = (args.warmup_patch_steps > 0) and (not args.resume)
-    if in_warmup:
-        print(f"=== Stage 1: Patch Warmup (steps 1..{args.warmup_patch_steps}) — training ONLY in_patch & out_patch ===", flush=True)
-        set_backbone_trainable(model, False)
-    else:
-        set_backbone_trainable(model, True)
+    set_warmup_trainable(model, warmup=in_warmup, num_edge_layers=args.warmup_edge_layers)
 
     optimizer = build_mup_optimizer(
         model,
@@ -849,13 +954,56 @@ def main():
     ema_fm = None
     ema_tot = None
     t0 = time.time()
-    pbar = tqdm(range(1, args.steps + 1), desc="HDM-FLUX2 PoC")
 
-    for step in pbar:
-        if in_warmup and step == args.warmup_patch_steps + 1:
+    def _micro_step(batch_x, captions, hw_px, log_ar, use_dfm: bool, scale_loss: float):
+        h_px, w_px = hw_px
+        b = batch_x.shape[0]
+        if use_cache:
+            latents = batch_x.to(device=device, dtype=torch.float32, non_blocking=True)
+        else:
+            imgs = batch_x.to(device=device, dtype=amp_dtype, non_blocking=True)
+            with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                latents = encode_flux2(vae, imgs, bn_mean, bn_std, sample_mode="sample", chunk_size=args.vae_chunk_size)
+
+        captions_drop = ["" if random.random() < 0.1 else c for c in captions]
+        toks = tokenizer(captions_drop, padding="longest", truncation=True, max_length=args.max_ctx_len, return_tensors="pt")
+        with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+            ctx = text_encoder(
+                input_ids=toks.input_ids.to(device, non_blocking=True),
+                attention_mask=toks.attention_mask.to(device, non_blocking=True),
+            ).last_hidden_state
+
+        pos_map = get_pos_map(h_px, w_px, b)
+        log_ars = torch.full((b,), log_ar, device=device, dtype=amp_dtype)
+
+        noise = torch.randn_like(latents, dtype=torch.float32)
+        t = torch.sigmoid(torch.randn(b, 1, 1, 1, device=device))
+        noisy = t * noise + (1.0 - t) * latents.float()
+        target = noise - latents.float()
+
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+            pred = model(noisy.to(amp_dtype), t.view(b).to(amp_dtype), ctx=ctx, pos_map=pos_map, addon_info=log_ars)
+
+        pred_f = pred.float()
+        fm_loss = F.mse_loss(pred_f, target)
+        if use_dfm and b > 1:
+            neg_idx = (torch.arange(b, device=device) + torch.randint(1, b, (b,), device=device)) % b
+            neg_loss = F.mse_loss(pred_f, target[neg_idx])
+            loss = (fm_loss - args.delta_fm_lambda * neg_loss) * scale_loss
+            neg_val = float(neg_loss.item()) * scale_loss
+        else:
+            loss = fm_loss * scale_loss
+            neg_val = 0.0
+
+        scaler.scale(loss).backward()
+        return float(loss.item()), float(fm_loss.item()) * scale_loss, neg_val
+
+    def _maybe_unfreeze(next_opt_step: int):
+        nonlocal in_warmup, optimizer
+        if in_warmup and next_opt_step > args.warmup_patch_steps:
             in_warmup = False
-            print(f"\n=== Stage 2: Unfreezing full XUDiT backbone at step {step} (DeltaFM lambda={args.delta_fm_lambda}) ===", flush=True)
-            set_backbone_trainable(model, True)
+            print(f"\n=== Stage 2: Unfreezing full XUDiT backbone at step {next_opt_step} (DeltaFM lambda={args.delta_fm_lambda}) ===", flush=True)
+            set_warmup_trainable(model, warmup=False)
             optimizer = build_mup_optimizer(
                 model,
                 base_lr=args.lr,
@@ -863,97 +1011,172 @@ def main():
                 use_cuda=(device.type == "cuda"),
             )
 
-        optimizer.zero_grad(set_to_none=True)
-        step_tot = 0.0
-        step_fm = 0.0
-        step_neg = 0.0
-        use_dfm = (not in_warmup) and (args.delta_fm_lambda > 0.0)
+    if args.epochs > 0:
+        if store is not None:
+            n_ep_batches = store.epoch_num_batches(args.batch_size)
+        else:
+            n_ep_batches = args.steps_per_epoch if args.steps_per_epoch > 0 else max(1, (len(shard_paths) * 5000) // args.batch_size)
+        steps_per_ep = max(1, n_ep_batches // args.grad_accum)
+        global_step = max(0, args.start_epoch - 1) * steps_per_ep
+        run_steps = 0
 
-        for _ in range(args.grad_accum):
-            batch_x, captions, (h_px, w_px), log_ar = next(data_iter)
-            b = batch_x.shape[0]
-            if use_cache:
-                latents = batch_x.to(device=device, dtype=torch.float32, non_blocking=True)
+        for epoch in range(args.start_epoch, args.epochs + 1):
+            ep_t0 = time.time()
+            ep_losses = []
+            ep_fm_losses = []
+            optimizer.zero_grad(set_to_none=True)
+            accum_cnt = 0
+            step_tot = 0.0
+            step_fm = 0.0
+            step_neg = 0.0
+
+            if store is not None:
+                batch_src = store.iter_epoch_batches(args.batch_size, seed=args.seed + epoch, tag_dropout=args.tag_dropout)
             else:
-                imgs = batch_x.to(device=device, dtype=amp_dtype, non_blocking=True)
-                # On-the-fly FLUX.2 VAE encode -> [B, 128, H/16, W/16]
-                with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                    latents = encode_flux2(vae, imgs, bn_mean, bn_std, sample_mode="sample", chunk_size=args.vae_chunk_size)
+                batch_src = (next(stream_iter) for _ in range(n_ep_batches))
 
-            captions_drop = ["" if random.random() < 0.1 else c for c in captions]
-            toks = tokenizer(captions_drop, padding="longest", truncation=True, max_length=args.max_ctx_len, return_tensors="pt")
-            with torch.no_grad(), torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                ctx = text_encoder(
-                    input_ids=toks.input_ids.to(device, non_blocking=True),
-                    attention_mask=toks.attention_mask.to(device, non_blocking=True),
-                ).last_hidden_state
+            pbar = tqdm(batch_src, total=n_ep_batches, desc=f"Epoch {epoch}/{args.epochs}")
+            for batch_x, captions, hw_px, log_ar in pbar:
+                if accum_cnt == 0:
+                    _maybe_unfreeze(global_step + 1)
+                use_dfm = (not in_warmup) and (args.delta_fm_lambda > 0.0)
+                l_tot, l_fm, l_neg = _micro_step(batch_x, captions, hw_px, log_ar, use_dfm=use_dfm, scale_loss=1.0 / args.grad_accum)
+                step_tot += l_tot
+                step_fm += l_fm
+                step_neg += l_neg
+                accum_cnt += 1
 
-            pos_map = get_pos_map(h_px, w_px, b)
-            log_ars = torch.full((b,), log_ar, device=device, dtype=amp_dtype)
+                if accum_cnt == args.grad_accum:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    run_steps += 1
+                    ep_losses.append(step_tot)
+                    ep_fm_losses.append(step_fm)
+                    ema_fm = step_fm if ema_fm is None else 0.98 * ema_fm + 0.02 * step_fm
+                    ema_tot = step_tot if ema_tot is None else 0.98 * ema_tot + 0.02 * step_tot
+                    img_s = (run_steps * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0)
+                    stage_tag = "warm" if in_warmup else "full"
+                    pbar.set_postfix(st=stage_tag, fm=f"{step_fm:.4f}", ema=f"{ema_fm:.4f}", dfm=f"{step_tot:.4f}")
 
-            noise = torch.randn_like(latents, dtype=torch.float32)
-            t = torch.sigmoid(torch.randn(b, 1, 1, 1, device=device))
-            noisy = t * noise + (1.0 - t) * latents.float()
-            target = noise - latents.float()
+                    if wb is not None and global_step % 50 == 0:
+                        wb.log(
+                            {
+                                "train/fm_loss": step_fm,
+                                "train/loss": step_tot,
+                                "train/contrastive_loss": step_neg,
+                                "train/ema_loss": ema_fm,
+                                "train/ema_total_loss": ema_tot,
+                                "train/epoch": epoch,
+                                "train/img_s": img_s,
+                                "train/stage": 1 if in_warmup else 2,
+                            },
+                            step=global_step,
+                        )
+                    accum_cnt = 0
+                    step_tot = 0.0
+                    step_fm = 0.0
+                    step_neg = 0.0
 
-            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-                pred = model(noisy.to(amp_dtype), t.view(b).to(amp_dtype), ctx=ctx, pos_map=pos_map, addon_info=log_ars)
+                    if args.val_every > 0 and global_step % args.val_every == 0:
+                        g_path = run_validation(
+                            model, text_encoder, tokenizer, vae, bn_mean, bn_std,
+                            out_dir, global_step, device, amp_dtype,
+                            prompts=val_prompts, resolution=args.val_res,
+                            num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed,
+                        )
+                        if wb is not None:
+                            import wandb
+                            wb.log({"val/grid": wandb.Image(str(g_path), caption=f"FLUX.2 Step {global_step}")}, step=global_step)
 
-            pred_f = pred.float()
-            fm_loss = F.mse_loss(pred_f, target)
-            scale_loss = 1.0 / args.grad_accum
-            if use_dfm and b > 1:
-                neg_idx = (torch.arange(b, device=device) + torch.randint(1, b, (b,), device=device)) % b
-                neg_loss = F.mse_loss(pred_f, target[neg_idx])
-                loss = (fm_loss - args.delta_fm_lambda * neg_loss) * scale_loss
-                step_neg += float(neg_loss.item()) * scale_loss
-            else:
-                loss = fm_loss * scale_loss
-
-            scaler.scale(loss).backward()
-            step_tot += float(loss.item())
-            step_fm += float(fm_loss.item()) * scale_loss
-
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-
-        ema_fm = step_fm if ema_fm is None else 0.98 * ema_fm + 0.02 * step_fm
-        ema_tot = step_tot if ema_tot is None else 0.98 * ema_tot + 0.02 * step_tot
-        img_s = (step * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0)
-        stage_tag = "warm" if in_warmup else "full"
-        pbar.set_postfix(st=stage_tag, fm=f"{step_fm:.4f}", ema=f"{ema_fm:.4f}", img_s=f"{img_s:.1f}")
-
-        if wb is not None and step % 25 == 0:
-            wb.log(
-                {
-                    "train/fm_loss": step_fm,
-                    "train/loss": step_tot,
-                    "train/contrastive_loss": step_neg,
-                    "train/ema_loss": ema_fm,
-                    "train/ema_total_loss": ema_tot,
-                    "train/img_s": img_s,
-                    "train/stage": 1 if in_warmup else 2,
-                },
-                step=step,
-            )
-
-        if args.val_every > 0 and step % args.val_every == 0:
+            ep_dt = time.time() - ep_t0
+            mean_ep = sum(ep_losses) / max(1, len(ep_losses))
+            mean_ep_fm = sum(ep_fm_losses) / max(1, len(ep_fm_losses))
+            print(f"=== Epoch {epoch}/{args.epochs} DONE ({ep_dt:.1f}s) | mean_fm={mean_ep_fm:.4f} | mean_dfm={mean_ep:.4f} | ema_fm={ema_fm:.4f} | step={global_step} ===", flush=True)
             g_path = run_validation(
                 model, text_encoder, tokenizer, vae, bn_mean, bn_std,
-                out_dir, step, device, amp_dtype,
+                out_dir, epoch, device, amp_dtype,
                 prompts=val_prompts, resolution=args.val_res,
                 num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed,
             )
             if wb is not None:
                 import wandb
-                wb.log({"val/grid": wandb.Image(str(g_path), caption=f"FLUX.2 PoC Step {step}")}, step=step)
-
-        if args.save_every > 0 and step % args.save_every == 0:
+                wb.log(
+                    {
+                        "epoch/mean_loss": mean_ep,
+                        "epoch/mean_fm_loss": mean_ep_fm,
+                        "epoch/ema_loss": ema_fm,
+                        "epoch/time_sec": ep_dt,
+                        "epoch": epoch,
+                        "val/grid": wandb.Image(str(g_path), caption=f"FLUX.2 Epoch {epoch}"),
+                    },
+                    step=global_step,
+                )
             clean_sd = clean_state_dict(model.state_dict())
             save_file(clean_sd, str(out_dir / "hdm_flux2_latest.safetensors"))
-            save_file(clean_sd, str(out_dir / f"hdm_flux2_step_{step:05d}.safetensors"))
+            if args.save_every > 0 and (epoch % args.save_every == 0 or epoch == args.epochs):
+                save_file(clean_sd, str(out_dir / f"hdm_flux2_epoch_{epoch:03d}.safetensors"))
+    else:
+        data_iter = store.iter_batches(args.batch_size, tag_dropout=args.tag_dropout, seed=args.seed) if store is not None else stream_iter
+        assert args.steps > 0, "Specify --epochs > 0 or --steps > 0"
+        pbar = tqdm(range(1, args.steps + 1), desc="HDM-FLUX2 PoC")
+        for step in pbar:
+            _maybe_unfreeze(step)
+            optimizer.zero_grad(set_to_none=True)
+            step_tot = 0.0
+            step_fm = 0.0
+            step_neg = 0.0
+            use_dfm = (not in_warmup) and (args.delta_fm_lambda > 0.0)
+            for _ in range(args.grad_accum):
+                batch_x, captions, hw_px, log_ar = next(data_iter)
+                l_tot, l_fm, l_neg = _micro_step(batch_x, captions, hw_px, log_ar, use_dfm=use_dfm, scale_loss=1.0 / args.grad_accum)
+                step_tot += l_tot
+                step_fm += l_fm
+                step_neg += l_neg
+
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+            ema_fm = step_fm if ema_fm is None else 0.98 * ema_fm + 0.02 * step_fm
+            ema_tot = step_tot if ema_tot is None else 0.98 * ema_tot + 0.02 * step_tot
+            img_s = (step * args.batch_size * args.grad_accum) / max(1e-3, time.time() - t0)
+            stage_tag = "warm" if in_warmup else "full"
+            pbar.set_postfix(st=stage_tag, fm=f"{step_fm:.4f}", ema=f"{ema_fm:.4f}", img_s=f"{img_s:.1f}")
+
+            if wb is not None and step % 25 == 0:
+                wb.log(
+                    {
+                        "train/fm_loss": step_fm,
+                        "train/loss": step_tot,
+                        "train/contrastive_loss": step_neg,
+                        "train/ema_loss": ema_fm,
+                        "train/ema_total_loss": ema_tot,
+                        "train/img_s": img_s,
+                        "train/stage": 1 if in_warmup else 2,
+                    },
+                    step=step,
+                )
+
+            if args.val_every > 0 and step % args.val_every == 0:
+                g_path = run_validation(
+                    model, text_encoder, tokenizer, vae, bn_mean, bn_std,
+                    out_dir, step, device, amp_dtype,
+                    prompts=val_prompts, resolution=args.val_res,
+                    num_steps=args.val_steps, cfg_scale=args.val_cfg, seed=args.seed,
+                )
+                if wb is not None:
+                    import wandb
+                    wb.log({"val/grid": wandb.Image(str(g_path), caption=f"FLUX.2 PoC Step {step}")}, step=step)
+
+            if args.save_every > 0 and step % args.save_every == 0:
+                clean_sd = clean_state_dict(model.state_dict())
+                save_file(clean_sd, str(out_dir / "hdm_flux2_latest.safetensors"))
+                save_file(clean_sd, str(out_dir / f"hdm_flux2_step_{step:05d}.safetensors"))
 
     save_file(clean_state_dict(model.state_dict()), str(out_dir / "hdm_flux2_final.safetensors"))
     print(f"Done in {time.time() - t0:.1f}s! Checkpoints & grids in {out_dir}", flush=True)
